@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -22,7 +23,7 @@ from retrieval_ranking_cascade.evaluation.shilling import (
 )
 from retrieval_ranking_cascade.pipeline import held_out_sessions
 from retrieval_ranking_cascade.serving.budget import BudgetController
-from retrieval_ranking_cascade.serving.cascade import Cascade, CascadeConfig
+from retrieval_ranking_cascade.serving.cascade import Cascade, CascadeConfig, CascadeResult
 
 pytestmark = pytest.mark.integration
 
@@ -246,9 +247,99 @@ def test_the_cascade_beats_popularity_on_true_relevance(corpus_report: dict[str,
 def test_the_gap_to_the_unservable_upper_bound_is_reported(
     corpus_report: dict[str, Any],
 ) -> None:
-    assert corpus_report["upper_bound_gap"] >= 0.0
-    assert 0.0 < corpus_report["upper_bound_retained"] <= 1.0
-    assert corpus_report["upper_bound_ndcg"] >= corpus_report["cascade_ndcg_at_k"] - 1e-9
+    """The bound is the reference the cascade is measured against, not a ceiling it cannot cross.
+
+    ``exact_rank`` scores the whole catalogue with the *same imperfect model*, so a candidate set
+    that happens to leave out items the model overrates can score higher on true relevance than the
+    full-catalogue ranking does. At ``small`` scale it does, by 0.0004 (see the README's corpus
+    table), and an assertion that the gap is non-negative would be asserting something this
+    repository's own measurement disproves. What is asserted instead is what the README claims: the
+    two numbers are computed over the same users and land close together, so the candidate set costs
+    almost nothing.
+    """
+    assert abs(corpus_report["upper_bound_gap"]) < 0.05
+    assert 0.8 < corpus_report["upper_bound_retained"] < 1.2
+    assert abs(corpus_report["upper_bound_ndcg"] - corpus_report["cascade_ndcg_at_k"]) < 0.05
+    # The bound was asked for over a subset of the sample, and is paired over exactly that subset.
+    assert corpus_report["upper_bound_users"] == 20
+    assert corpus_report["upper_bound_paired_users"] == corpus_report["upper_bound_users"]
+
+
+class _BlanksOneUser(Cascade):
+    """A cascade that serves an empty page for one user, which the corpus loop then skips.
+
+    Real causes exist - the category cap can shorten a page, and a heavy user's candidate set can
+    empty after the seen filter - so the paired comparison against the exact-ranking bound must
+    line policies up by user rather than by arrival order.
+    """
+
+    def __init__(
+        self, bundle: Any, controller: BudgetController, config: CascadeConfig, blank_user: int
+    ) -> None:
+        super().__init__(bundle, controller, config)
+        self._blank_user = blank_user
+
+    def recommend(self, user_id: int, **kwargs: Any) -> CascadeResult:
+        result = super().recommend(user_id, **kwargs)
+        return replace(result, items=()) if user_id == self._blank_user else result
+
+
+def _blanking_cascade(training: Any, blank_user: int) -> _BlanksOneUser:
+    controller = BudgetController(total_seconds=1.0, retrieval_seconds=0.4, ranking_seconds=0.4)
+    return _BlanksOneUser(
+        training.bundle,
+        controller,
+        CascadeConfig(candidate_k=200, rerank_depth=120, default_k=10),
+        blank_user,
+    )
+
+
+def test_the_upper_bound_is_paired_by_user_and_not_by_position(tiny_training: Any) -> None:
+    """The headline retention must not depend on every policy having scored every user.
+
+    Dropping the *first* user from the cascade's rows is the worst case for positional pairing: it
+    shifts every later row by one, so the two means would be taken over different user sets and
+    nothing would say so. Evaluating the same sample minus that user must give the same paired
+    numbers.
+    """
+    users = make_user_sample(
+        held_out_sessions(tiny_training), tiny_training.bundle.n_users, 20, seed=2
+    )
+    stub = _blanking_cascade(tiny_training, int(users[0]))
+    blanked: dict[str, Any] = corpus_evaluation(
+        cascade=stub,
+        world=tiny_training.world,
+        users=users,
+        k=10,
+        upper_bound_users=users.size,
+    )
+    without: dict[str, Any] = corpus_evaluation(
+        cascade=stub,
+        world=tiny_training.world,
+        users=users[1:],
+        k=10,
+        upper_bound_users=users.size - 1,
+    )
+    assert blanked["upper_bound_retained"] == without["upper_bound_retained"]
+    assert blanked["upper_bound_gap"] == without["upper_bound_gap"]
+    # The skip really happened, so the assertions above are not vacuous.
+    assert blanked["cascade_relevance"]["users"] == users.size - 1
+    assert blanked["exact_rank"]["users"] == users.size
+    assert blanked["upper_bound_paired_users"] == users.size - 1
+
+
+def test_no_retention_is_reported_when_no_user_has_both_numbers(tiny_training: Any) -> None:
+    users = make_user_sample(
+        held_out_sessions(tiny_training), tiny_training.bundle.n_users, 20, seed=2
+    )
+    stub = _blanking_cascade(tiny_training, int(users[0]))
+    report: dict[str, Any] = corpus_evaluation(
+        cascade=stub, world=tiny_training.world, users=users, k=10, upper_bound_users=1
+    )
+    assert report["exact_rank"]["users"] == 1
+    assert report["upper_bound_paired_users"] == 0
+    assert report["upper_bound_retained"] is None
+    assert report["upper_bound_gap"] is None
 
 
 def test_the_diversity_rules_cost_relevance_and_buy_coverage(

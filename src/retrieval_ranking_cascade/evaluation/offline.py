@@ -20,9 +20,19 @@ recommend what it retrieves. Four policies are compared -
   *below* ``cascade_relevance`` on relevance and above it on coverage and diversity; that
   difference is the price of the diversity rules, reported rather than hidden;
 * ``exact_rank`` - the LambdaMART model applied to *every* item in the catalogue. Unservable at
-  50 ms, it is the upper bound the cascade is trying to approximate, and the gap between it and
-  ``cascade`` is the price of the cascade's two approximations (a finite candidate set and an
-  approximate search inside it).
+  50 ms, it is the reference the cascade is trying to approximate, and the gap between it and
+  ``cascade_relevance`` is the price of the cascade's two approximations (a finite candidate set and
+  an approximate search inside it).
+
+Two things about ``exact_rank`` decide how it may be read. It is computed for the first
+``upper_bound_users`` users only, because scoring the whole catalogue per user is the most expensive
+thing here, so its mean is over a different (smaller) population than the other rows unless the
+caller asks for every user - which is why every row carries its own ``users`` count and the
+retention is paired by user id rather than by arrival order. And it is a raw top-k by model score:
+it skips MMR and the per-category cap that ``cascade`` applies, so it bounds how far the *ranker*
+can see, not how good a rules-constrained page could be. It is also not a guaranteed ceiling on
+true relevance - a policy scoring the whole catalogue with an imperfect model can land below one
+scoring a candidate set, and on the cold-user slice measured in the README it does.
 
 Because the ideal ranking here is over the full catalogue, NDCG is normalized by the best k items
 a perfect policy could have chosen, so an NDCG of 1.0 would mean "exactly the k most relevant
@@ -291,7 +301,13 @@ def corpus_evaluation(
     cold_click_threshold: int = 1,
     ef_search: int | None = None,
 ) -> dict[str, object]:
-    """Full-corpus top-k for each policy, scored against the world's true relevance."""
+    """Full-corpus top-k for each policy, scored against the world's true relevance.
+
+    ``upper_bound_users`` caps how many of the sampled users also get the unservable ``exact_rank``
+    row; pass ``len(users)`` to make every row comparable, or 0 to skip the bound entirely. Each
+    policy's block reports the ``users`` it was averaged over, and ``upper_bound_retained`` is
+    computed only over the users that both ``cascade_relevance`` and ``exact_rank`` scored.
+    """
     if k < 1:
         raise ValueError("k must be >= 1")
     bundle = cascade.bundle
@@ -299,7 +315,10 @@ def corpus_evaluation(
     if sample.size == 0:
         raise ValueError("users must not be empty")
     policies = ("popularity", "tower", "cascade_relevance", "cascade", "exact_rank")
-    ndcgs: dict[str, list[float]] = {name: [] for name in policies}
+    # Keyed by user, not appended: a policy can return nothing for a user (the category cap can
+    # shorten a page, and a heavy user's candidate set can empty after the seen filter), and the
+    # retention below has to pair the two policies over the users that both of them scored.
+    ndcgs: dict[str, dict[int, float]] = {name: {} for name in policies}
     similarity: dict[str, list[float]] = {name: [] for name in policies}
     served: dict[str, list[int]] = {name: [] for name in policies}
     cold_item_share: dict[str, list[float]] = {name: [] for name in policies}
@@ -332,7 +351,7 @@ def corpus_evaluation(
             if items.size == 0:
                 continue
             score = ndcg(relevance[items], k, ideal_gains=ideal)
-            ndcgs[name].append(score)
+            ndcgs[name][user_index] = score
             similarity[name].append(intra_list_similarity(bundle.item_vectors[items]))
             served[name].extend(int(item) for item in items)
             cold_item_share[name].append(float(np.mean(launch[items] > 0)))
@@ -344,7 +363,9 @@ def corpus_evaluation(
         if not ndcgs[name]:
             continue
         report[name] = {
-            "ndcg_at_k": round(float(np.mean(ndcgs[name])), 6),
+            "ndcg_at_k": round(float(np.mean(list(ndcgs[name].values()))), 6),
+            # Per policy, because ``exact_rank`` is normally computed for a subset of the sample:
+            # a table that prints one user count for every row invites an unpaired comparison.
             "users": len(ndcgs[name]),
             "intra_list_similarity": round(float(np.mean(similarity[name])), 6),
             "catalog_coverage": round(catalog_coverage(served[name], bundle.n_items), 6),
@@ -354,22 +375,41 @@ def corpus_evaluation(
             ),
             "cold_users": len(cold_user_ndcg[name]),
         }
-    cascade_ndcg = float(np.mean(ndcgs["cascade_relevance"]))
+    cascade_scores = ndcgs["cascade_relevance"]
+    cascade_ndcg = float(np.mean(list(cascade_scores.values())))
     if ndcgs["exact_rank"]:
-        bound = float(np.mean(ndcgs["exact_rank"]))
-        shared = min(len(ndcgs["cascade_relevance"]), len(ndcgs["exact_rank"]))
-        paired_cascade = float(np.mean(ndcgs["cascade_relevance"][:shared]))
-        paired_bound = float(np.mean(ndcgs["exact_rank"][:shared]))
-        report["upper_bound_gap"] = round(paired_bound - paired_cascade, 6)
-        report["upper_bound_retained"] = (
-            round(paired_cascade / paired_bound, 6) if paired_bound > 0 else None
-        )
-        report["upper_bound_ndcg"] = round(bound, 6)
+        report.update(_upper_bound_block(cascade_scores, ndcgs["exact_rank"]))
     # The headline number compares like with like: the reranker without the diversity rules.
     report["cascade_ndcg_at_k"] = round(cascade_ndcg, 6)
-    report["cascade_served_ndcg_at_k"] = round(float(np.mean(ndcgs["cascade"])), 6)
-    report["diversity_cost"] = round(cascade_ndcg - float(np.mean(ndcgs["cascade"])), 6)
+    served_ndcg = float(np.mean(list(ndcgs["cascade"].values())))
+    report["cascade_served_ndcg_at_k"] = round(served_ndcg, 6)
+    report["diversity_cost"] = round(cascade_ndcg - served_ndcg, 6)
     return report
+
+
+def _upper_bound_block(
+    cascade_scores: dict[int, float], bound_scores: dict[int, float]
+) -> dict[str, object]:
+    """How much of the exact-ranking bound the cascade keeps, over the users both of them scored.
+
+    Pairing by user id is the whole point: the two policies are evaluated in the same loop but a
+    policy is skipped for a user it returns nothing for, and the bound is usually computed for a
+    prefix of the sample, so lining the two score lists up by arrival order can silently average
+    over different populations. ``upper_bound_ndcg`` is the bound's own mean over every user it was
+    computed for, which is the number the table's ``exact_rank`` row shows.
+    """
+    paired = sorted(cascade_scores.keys() & bound_scores.keys())
+    paired_cascade = float(np.mean([cascade_scores[user] for user in paired])) if paired else 0.0
+    paired_bound = float(np.mean([bound_scores[user] for user in paired])) if paired else 0.0
+    return {
+        "upper_bound_gap": round(paired_bound - paired_cascade, 6) if paired else None,
+        "upper_bound_retained": (
+            round(paired_cascade / paired_bound, 6) if paired and paired_bound > 0 else None
+        ),
+        "upper_bound_ndcg": round(float(np.mean(list(bound_scores.values()))), 6),
+        "upper_bound_users": len(bound_scores),
+        "upper_bound_paired_users": len(paired),
+    }
 
 
 def _tower_top_k(
