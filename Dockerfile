@@ -35,7 +35,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --home-dir /nonexistent \
-       --shell /usr/sbin/nologin app
+       --shell /usr/sbin/nologin app \
+    # The bundle and audit mount points must exist in the image and be owned by the app user:
+    # Docker copies an image directory's ownership onto a fresh named volume, and a mount point
+    # Docker has to invent instead lands as root:root 0755, which a uid-10001 process cannot write.
+    # Without this, `compose run train` dies writing the bundle and the audit log stays unwritable.
+    && install -d -o 10001 -g 10001 -m 0755 \
+       /var/lib/cascade /var/lib/cascade/bundle /var/lib/cascade/audit
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
