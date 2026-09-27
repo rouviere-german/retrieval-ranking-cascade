@@ -93,6 +93,21 @@ def test_observing_a_loaded_sample_moves_the_rate_only() -> None:
     assert estimator.seconds_per_unit == pytest.approx(1e-4)
 
 
+def test_serving_traffic_never_refits_the_fixed_term() -> None:
+    """The documented shape of the model: one fitted parameter, one measured constant.
+
+    Every serving call site reports at least one unit of work (``retrieval_units`` floors at
+    ``max(ef, k) >= 16``, ranking at one row), so no live sample reaches the ``units <= 0`` branch.
+    Whatever the fixed seed gets wrong is absorbed by the per-unit rate.
+    """
+    estimator = CostEstimator(fixed_seconds=3e-4, seconds_per_unit=6e-7, alpha=0.5)
+    for _ in range(500):
+        estimator.observe(150.0, 0.020)
+    assert estimator.fixed_seconds == 3e-4
+    assert estimator.seconds_per_unit == pytest.approx((0.020 - 3e-4) / 150.0, rel=1e-6)
+    assert estimator.samples == 500
+
+
 def test_a_sample_faster_than_the_fixed_cost_drives_the_rate_to_zero_not_negative() -> None:
     estimator = CostEstimator(fixed_seconds=0.005, seconds_per_unit=1e-4, alpha=1.0)
     estimator.observe(50.0, 0.001)
@@ -314,6 +329,22 @@ def test_an_extremely_tight_retrieval_budget_also_lowers_the_candidate_count() -
     assert plan.ef_search >= 16
 
 
+def test_lowering_the_candidate_count_also_lowers_a_now_oversized_ef_search() -> None:
+    """A graph walk that visits more nodes than the caller will keep is pure waste.
+
+    ``retrieval_units`` is ``max(ef, k)``, so once the ladder has cut ``candidate_k`` an
+    ``efSearch`` above it costs time and buys nothing: the extra neighbours are found, then dropped.
+    """
+    estimators = {
+        "retrieval": CostEstimator(fixed_seconds=0.0, seconds_per_unit=1e-4, safety_factor=1.0),
+        "ranking": CostEstimator(fixed_seconds=0.0, seconds_per_unit=1e-9, safety_factor=1.0),
+    }
+    controller = _controller(total=0.050, retrieval=0.003, estimators=estimators)
+    plan = controller.start().plan_retrieval(500, 768)
+    assert plan.candidate_k < 500
+    assert plan.ef_search <= plan.candidate_k
+
+
 def test_the_ladder_stops_at_the_floors_even_when_nothing_fits() -> None:
     """A budget nothing can satisfy must terminate at the minimum, not loop forever."""
     estimators = {
@@ -474,6 +505,9 @@ def test_a_retrieval_plan_never_grows_the_request_and_respects_the_floors(
     assert plan.ef_search <= ef_search
     assert plan.candidate_k >= min(16, candidate_k)
     assert plan.ef_search >= min(16, ef_search)
+    if plan.candidate_k < candidate_k:
+        # Once the candidate count has been cut, efSearch above it is work nobody reads.
+        assert plan.ef_search <= max(plan.candidate_k, 16)
     assert plan.lowered == (plan.ef_search < ef_search or plan.candidate_k < candidate_k)
 
 

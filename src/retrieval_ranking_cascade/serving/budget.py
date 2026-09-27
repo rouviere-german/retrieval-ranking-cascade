@@ -6,12 +6,21 @@ requests actually cost, compares the prediction with the time left in the reques
 either lets the stage run, shrinks its work, or skips it.
 
 Cost model. Each stage declares how many "units" of work it plans to do (candidates to fetch,
-candidates to score). A stage's cost is modelled as ``fixed + rate * units``, where ``fixed`` and
-``rate`` are exponentially weighted moving averages over observed (units, seconds) pairs, inflated
-by ``safety_factor`` so a prediction is a pessimistic estimate rather than an average. The split
-between the two terms is fitted online: ``observe`` attributes a sample to ``fixed`` when
-``units`` is at the stage's minimum and to ``rate`` otherwise, which is enough for the two-stage
-retrieval/ranking shape here and needs no matrix algebra on the request path.
+candidates to score). A stage's cost is modelled as ``fixed + rate * units``, inflated by
+``safety_factor`` so a prediction is a pessimistic estimate rather than an average.
+
+Only ``rate`` is fitted online, as an exponentially weighted moving average of
+``(seconds - fixed) / units`` over the samples a stage reports; this is a one-parameter fit, not
+two. ``fixed`` is a *measured constant* for the reference CPU, seeded per stage in
+:class:`BudgetController` and never moved by live traffic, because no serving call site ever reports
+zero units: retrieval always plans at least
+``max(ef, k) >= 16`` nodes, ranking at least one row, the rules stage at least one item. Time above
+the seeded intercept is therefore folded into ``rate``, which is the term the ladder divides by, so
+an under- or over-stated intercept shows up as a slightly conservative or optimistic per-unit rate
+rather than as a wrong shape. ``observe(0.0, seconds)`` does update ``fixed``, for callers (tests,
+and any future stage with a genuine no-work path) that can measure the intercept directly. Fitting
+both terms would need a running least squares over ``(units, seconds)`` or bucketed EWMAs; it is not
+implemented, and ``test_budget.py`` pins the current behaviour so this description cannot drift.
 
 Degradation ladder, cheapest loss of quality first:
 
@@ -278,7 +287,11 @@ class RequestBudget:
                 current_ef = max(_MIN_EF_SEARCH, current_ef // 2)
             elif current_k > _MIN_CANDIDATES:
                 current_k = max(_MIN_CANDIDATES, current_k // 2)
-                current_ef = min(current_ef, max(_MIN_EF_SEARCH, current_ef))
+                # A search that visits more nodes than the caller keeps is waste: units are
+                # max(ef, k), so follow the candidate count down - but only ever down. A request
+                # may legitimately ask for an efSearch below the floor, and the plan must never
+                # hand back more work than was asked for.
+                current_ef = min(current_ef, max(_MIN_EF_SEARCH, current_k))
             else:
                 current_ef = max(_MIN_EF_SEARCH, current_ef // 2)
             predicted = self._predict(
@@ -362,8 +375,10 @@ class BudgetController:
         self.retrieval_seconds = retrieval_seconds
         self.ranking_seconds = ranking_seconds
         self._clock = clock
-        # Initial guesses, measured on the reference CPU (see bench/bench_load.py). They only
-        # matter for the first few requests: observe() replaces them with what this box does.
+        # Seeds measured on the reference CPU (see bench/bench_load.py). The per-unit rates only
+        # matter for the first few requests - observe() replaces them with what this box does - but
+        # the fixed terms stay as they are, because serving never reports a zero-unit sample (see
+        # the module docstring).
         defaults = {
             "retrieval": CostEstimator(fixed_seconds=2e-4, seconds_per_unit=4e-7),
             "ranking": CostEstimator(fixed_seconds=3e-4, seconds_per_unit=6e-7),
