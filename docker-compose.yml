@@ -1,0 +1,70 @@
+# Local stack. Only locally built images; nothing is pulled at run time besides the pinned bases.
+#
+#   docker compose run --rm train      # write a bundle into the shared volume
+#   docker compose up app              # serve it
+#
+# The service has no model baked in, so `train` has to run first. `train` needs a writable volume
+# and therefore is not read-only; `app` is.
+x-hardening: &hardening
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+
+services:
+  app:
+    build:
+      context: .
+    image: retrieval-ranking-cascade:local
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      # Comma-separated SHA-256 digests; generate with
+      # `docker compose run --rm app generate-api-key`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      # Digests of keys that additionally hold the admin scope (reindex, bundle swap, canary).
+      # An admin key must also appear in APP_API_KEY_SHA256.
+      APP_ADMIN_API_KEY_SHA256: ${APP_ADMIN_API_KEY_SHA256:-}
+      APP_BUNDLE_DIR: /var/lib/cascade/bundle
+      APP_AUDIT_LOG_PATH: /var/lib/cascade/audit/admin.jsonl
+      APP_SERVER_THREADS: ${APP_SERVER_THREADS:-8}
+      APP_FAISS_THREADS: "1"
+    volumes:
+      # Read-only: a serving process never writes to a bundle.
+      - bundle:/var/lib/cascade/bundle:ro
+      - audit:/var/lib/cascade/audit
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    <<: *hardening
+    mem_limit: 1g
+    cpus: 2.0
+    restart: unless-stopped
+
+  # One-shot: train a bundle into the shared volume. `--scale small` is the demo world
+  # (5k users, 10k items) and takes about 15 s on six cores; `--scale full` is the 50k/100k world.
+  train:
+    build:
+      context: .
+    image: retrieval-ranking-cascade:local
+    command: ["train", "--scale", "small", "--out", "/var/lib/cascade/bundle"]
+    environment:
+      APP_LOG_LEVEL: INFO
+      APP_DATA_DIR: /var/lib/cascade
+    volumes:
+      - bundle:/var/lib/cascade/bundle
+    read_only: false
+    tmpfs:
+      - /tmp:size=64m
+    <<: *hardening
+    mem_limit: 2g
+    cpus: 4.0
+    restart: "no"
+
+volumes:
+  bundle:
+  audit:
