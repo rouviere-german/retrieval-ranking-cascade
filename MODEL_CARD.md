@@ -98,29 +98,31 @@ question that matters, answerable only because the world is synthetic.
 | recall@500 vs exact, efSearch 768 | **0.9771** | The ceiling on everything downstream: an item retrieval misses can never be recommended |
 | Slate NDCG@10, ground truth — cascade / tower / popularity | **0.8545** / 0.8324 / 0.7442 | The cascade beats both baselines on the protocol the ranker was trained for |
 | Slate NDCG@10, ground truth — logged policy | 0.8629 | Reported so the cascade is not compared against a straw man |
-| Corpus NDCG@10 — cascade / tower / popularity | 0.6054 / 0.6205 / 0.3224 | Beats popularity by 0.28; **does not beat the tower** (see Caveats) |
-| Corpus NDCG@10 — exact full-corpus ranking | 0.6264 | The unservable upper bound the cascade approximates |
-| Upper bound retained | **0.9998** (gap 0.0001) | The cascade's own two approximations cost essentially nothing |
+| Corpus NDCG@10 — cascade / tower / popularity | 0.6100 / 0.6205 / 0.3224 | Beats popularity by 0.29; **does not beat the tower** (see Caveats) |
+| Corpus NDCG@10 — exact full-corpus ranking | 0.6095 | The unservable reference the cascade approximates, over the same 150 users |
+| Reference retained | **1.0007** (gap -0.0004) | The cascade's own two approximations cost no measurable quality; the reference is not a ceiling |
 | Per-rank relevance bias, naive / IPS | 0.2513 / **0.0373** (85.2% reduction) | Whether the bias correction works at all |
 | Policy-advantage bias, naive / IPS | 0.1406 / 0.1063 (24.4% reduction) | The harder, more realistic question; a much smaller win, reported as such |
 | Examination exponent, estimated / true | 1.024 / 1.0 | Recovered from the randomized slice alone |
-| Intra-list similarity, MMR off / as served | 0.5025 / 0.4970 | What the diversity rules buy, at a cost of 0.0038 NDCG |
-| Catalog coverage, popularity / cascade | 0.0015 / 0.0230 | A cascade is not just more accurate, it shows more of the catalogue |
-| Simulated CTR (feedback simulator) | 0.1983 | Closes the serve-observe loop; an assumption, not a measurement |
-| Served p50 / p99 at 50 RPS | 12.53 ms / **19.89 ms** | `bench/bench_load.py`; the 50 ms SLO, with zero errors |
+| Intra-list similarity, MMR off / as served | 0.5128 / 0.5062 | What the diversity rules buy, at a cost of 0.0041 NDCG |
+| Catalog coverage, popularity / cascade | 0.0015 / 0.0226 | A cascade is not just more accurate, it shows more of the catalogue |
+| Simulated CTR (feedback simulator) | 0.1975 | Closes the serve-observe loop; an assumption, not a measurement |
+| Served p50 / p99 at 50 RPS | 12.74 ms / **20.51 ms** | `bench/bench_load.py`; the 50 ms SLO, with zero errors |
 
-**Slices.** Cold users (at most one click in the history period) score 0.4176 against 0.6015 overall
-for the served cascade, and 0.2733 against 0.3224 for popularity — the cascade's advantage over
-popularity is *larger* on cold users, not smaller. Cold items (launched after day 0) make up 6.6% of
-the cascade's lists against 0.0% of popularity's; the exact full-corpus ranking pushes that to 21.3%,
-so the candidate set is what limits cold-item exposure, not the ranker.
+**Slices.** Every corpus row, the exact full-corpus ranking included, is averaged over the same 150
+sampled users, and each row reports its own user count. Cold users (at most one click in the history
+period, 19 of the 150) score 0.4115 against 0.6059 overall for the served cascade, and 0.2733 against
+0.3224 for popularity — the cascade's advantage over popularity is *larger* on cold users, not smaller.
+Cold items (launched after day 0) make up 6.5% of the cascade's lists against 0.0% of popularity's; the
+exact full-corpus ranking pushes that to 15.1%, so the candidate set is what limits cold-item exposure,
+not the ranker.
 
-**Ablations.** logQ correction on/off: recall 0.9748 / 0.9827 and corpus NDCG 0.6054 / 0.5933, so it
-trades a little recall for ranking quality. Ranker labels: IPS weights 0.6054 corpus NDCG against
-naive clicks 0.5672 and LightGBM's unbiased lambdarank 0.4709 — the last wins the slate metric
+**Ablations.** logQ correction on/off: recall 0.9748 / 0.9827 and corpus NDCG 0.6100 / 0.5886, so it
+trades a little recall for ranking quality. Ranker labels: IPS weights 0.6100 corpus NDCG against
+naive clicks 0.5690 and LightGBM's unbiased lambdarank 0.4834 — the last wins the slate metric
 (0.8722) and loses the corpus metric badly, which is why it is off by default. Rerank depth: quality
-saturates past 100 (0.6100) while cost is linear (2.8 ms at depth 50 to 8.8 ms at 500), so the
-default of 150 buys nothing over 100 at this scale.
+peaks at 100 (0.6100 against 0.6054 at 150) while cost is linear (2.97 ms at depth 50 to 9.38 ms at
+500), which is why the served default is 100 rather than the 150 this repo first shipped.
 
 ## Robustness, drift and monitoring
 
@@ -176,15 +178,18 @@ period for the impression log, which this repo does not model.
 
 ## Caveats and recommendations
 
-- **The reranker does not beat the tower on the full-corpus protocol** (0.6054 against 0.6205). The
-  `exact_rank` row (0.6264) shows the limit is the ranker, not the cascade: scoring every item with
-  the same model barely improves on the tower. The ranker is trained on the slates the logging policy
-  chose, which is the only supervision click data honestly provides, and that distribution does not
-  cover the catalogue. Do not read the cascade's corpus NDCG as evidence that LambdaMART reranking
-  pays off at every scale — read the slate table, where it does.
-- **At 10k items the ANN index is slower than brute force** (0.12x). A 32-dimensional index over a
-  small catalogue is not where HNSW wins; the fitted cost lines in the bench output put the crossover
-  far above this scale. The index is here for the `full` world and for the recall knob it exposes.
+- **The reranker does not beat the tower on the full-corpus protocol** (0.6100 against 0.6205). The
+  `exact_rank` row (0.6095, same 150 users) shows the limit is the model and not the cascade: scoring
+  every item in the catalogue with it does not beat the tower either. The ranker is trained on the
+  slates the logging policy chose, which is the only supervision click data honestly provides, and that
+  distribution does not cover the catalogue. Do not read the cascade's corpus NDCG as evidence that
+  LambdaMART reranking pays off at every scale — read the slate table, where it does.
+- **At 10k items the ANN index is slower than brute force** (0.12x), and at 100k it is still slower
+  (0.64x) for the 500 candidates this cascade asks for; the four-point fit puts the crossover near
+  197k items. The same index at 100k items is 15.5x faster than brute force for a 10-neighbour query,
+  so the trade is about candidate count and dimension, not about HNSW being wrong. The index is here
+  for the recall knob it exposes, the canary it makes meaningful, and the catalogue sizes past that
+  crossover.
 - **The evaluation grades a model against a world this repo also wrote.** Ground-truth relevance is
   available because the generator owns it. That is what makes the bias measurement possible, and it
   is also the reason none of these numbers say anything about real data.

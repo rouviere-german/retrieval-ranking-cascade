@@ -63,21 +63,26 @@ the ranking itself. Quality is given up in the order that buys the most time per
 
 ## Consequences
 
-- **Measured.** At 50 RPS on the reference CPU the service holds p50 14.0 ms and p99 48.7 ms with 0
-  errors and 0% degraded responses. At 2x it still keeps up, so it correctly does not degrade. At 4x it
-  holds 199.7 of 200 RPS with 0 errors and 0.6% of responses degraded, spread across all three ladder
-  steps.
+- **Measured.** At 50 RPS on the reference CPU the service holds p50 12.7 ms and p99 20.5 ms with 0
+  errors and 0% degraded responses (`bench/results/load.json`; an earlier run taken while the machine
+  was also running the test suite measured p99 48.7 ms, which is the box and not the code). At 2x it
+  still keeps up, so it correctly does not degrade. At 4x it holds 200.0 of 200 RPS with 0 errors and
+  0.1% of responses degraded.
 - The invariant CI enforces is the one this decision is really about, and it is deliberately not "does
-  it degrade at 2x": **whenever throughput falls behind the offered rate, the degraded-response rate
-  must be non-zero.** Falling behind while still planning full work is precisely the failure this
-  design exists to prevent, and it is machine-independent in a way an absolute p99 is not.
+  it degrade at 2x": **whenever throughput falls behind the offered rate, at least 10% of responses
+  must be degraded** (`min_degraded_rate_when_behind`). Falling behind while still planning full work is
+  precisely the failure this design exists to prevent, and it is machine-independent in a way an
+  absolute p99 is not. It is asserted only for a phase where the *server* fell behind: when the load
+  generator's own connection pool is the queue, client-observed latency runs orders of magnitude above
+  the server's own view of the same requests at the median or the tail, and the phase is reported as
+  harness-limited instead.
 - A caller can tell a slow-but-complete response from a fast-but-degraded one, because the flag and
   the reasons are in the body and in the metrics. A dashboard that only watched latency would see the
   4x phase as healthy.
 - **The budget can still be overshot.** One pathological call — an unexpectedly slow feature lookup, a
-  GC pause inside a stage — is not interrupted. The measured 4x p99 of 166 ms is the honest shape of
-  that: the controller keeps *throughput* and *errors* intact, and the tail degrades gracefully rather
-  than being clamped.
+  GC pause inside a stage — is not interrupted. The measured 4x client p99 of 124.7 ms against a
+  server-side 38.3 ms is the honest shape of that: the controller keeps *throughput* and *errors*
+  intact, and the tail degrades gracefully rather than being clamped.
 - Cost estimates are per process and start from documented defaults measured on the reference CPU. A
   fresh process plans with those guesses for the first few requests; a restart resets any drift, which
   is a useful property when an estimator has been polluted by an outlier.

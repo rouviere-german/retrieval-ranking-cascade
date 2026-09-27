@@ -79,7 +79,8 @@ the expensive stage never scores an item that was going to be dropped.
 statistics, tower similarity and recency. Features are precomputed into a hash-verified snapshot
 loaded at startup; online feature stores are out of scope. The same `assemble_features` builds
 training and serving rows, so they cannot drift apart. Each serving thread parses its own booster
-from the shared model text — a single booster behind a mutex serializes the whole stage.
+from the shared model text: a single booster behind a mutex serializes the whole stage, measured at
+4.9x less throughput under eight callers (`bench/bench_baseline.py::bench_ranker_predict_threads`).
 
 **Stage 3, rules.** MMR diversity (Carbonell and Goldstein, SIGIR 1998) over a bounded window, then
 a hard per-category cap applied as an order-preserving filter.
@@ -129,7 +130,8 @@ uv run retrieval-ranking-cascade audit verify var/audit/admin.jsonl
 ```
 
 Scales: `tiny` (300 users, tests), `smoke` (500 users, the CI training smoke), `small` (5k users,
-10k items, the demo and the benches), `full` (50k users, 100k items, the specification's world).
+10k items, the demo and the benches), `full` (50k users, 100k items, the specification's world - the
+CLI and the benches accept it, but no number in this README comes from it; see Non-goals).
 
 The benches are separate because they take longer than `tasks.py bench`:
 
@@ -154,28 +156,58 @@ table names the command that produced it. CI runs the same commands against the 
 ### Cascade quality
 
 `uv run python bench/bench_quality.py --check --ablations` — `small` scale (5k users, 10k items,
-~200k impressions), one training run of 14.2 s feeding every block, 44 s total. Printed
-"all quality thresholds met".
+~200k impressions), one training run of 13.4 s feeding every block, **124.7 s** total; the same
+command without `--ablations` is **70.4 s**. Both printed "all quality thresholds met", and every
+number in this section comes from the run recorded in `bench/results/quality.json`.
 
 Retrieval, recall@500 against exact search over 200 queries:
 
 | efSearch | recall@500 | recall p05 | ANN ms/query |
 |---:|---:|---:|---:|
-| 64 | 0.6232 | 0.4997 | 0.118 |
-| 128 | 0.8057 | 0.6457 | 0.207 |
-| 256 | 0.9313 | 0.7659 | 0.352 |
-| 512 | 0.9757 | 0.9340 | 0.601 |
-| **768 (default)** | **0.9771** | **0.9360** | **1.053** |
-| 1024 | 0.9774 | 0.9360 | 1.761 |
+| 64 | 0.6232 | 0.4997 | 0.126 |
+| 128 | 0.8057 | 0.6457 | 0.204 |
+| 256 | 0.9313 | 0.7659 | 0.364 |
+| 512 | 0.9757 | 0.9340 | 0.616 |
+| **768 (default)** | **0.9771** | **0.9360** | **1.099** |
+| 1024 | 0.9774 | 0.9360 | 1.775 |
 
-Exact brute force over the same queries: 0.35 ms/query, so **at 10k items the ANN index is
-slower than brute force** (0.3x). That is the honest reading of a 32-dimensional index over a small
-catalogue: a 10k x 32 matmul is memory-bandwidth-bound and finishes in a fraction of a millisecond,
-while HNSW pays a fixed graph-traversal cost of roughly 1 ms whatever the catalogue size. The bench
-also prints a two-point fit of cost against catalogue size; on this box it is too noisy to quote
-(across runs it produced both positive and negative slopes for the exact baseline), which is itself
-worth knowing — two sizes and a shared CPU are not enough to measure a scaling law. The index is here
-for the `full` world and for the recall/latency knob it exposes, not because it is faster at 10k.
+**Does the index earn its place?** Not at this catalogue size and this candidate count, and the bench
+answers with numbers rather than a caveat. Exact brute force over the same 200 queries costs
+0.136 ms/query, so at 10k items the graph walk is about **8x slower** than one dense 10k x 32 matmul.
+Since the `small` world is the only world this repo trains, the scaling block measures the cost curve
+on larger catalogues directly: rows past the trained 10k are real item embeddings resampled with
+Gaussian noise and rescaled to the norm of the row they came from, which keeps the cluster structure
+the graph walks over. Search cost and recall against exact search *on the same catalogue* are real
+measurements of the index at that size; relevance on those rows would not be, and nothing uses them
+for it.
+
+| catalogue size | resampled rows | ANN ms/query | exact ms/query | ANN speedup | recall@500 |
+|---:|---:|---:|---:|---:|---:|
+| 2 500 | 0 | 1.015 | 0.073 | 0.07x | 0.9756 |
+| 10 000 (as trained) | 0 | 1.137 | 0.135 | 0.12x | 0.9771 |
+| 50 000 | 40 000 | 1.237 | 0.518 | 0.42x | 0.9980 |
+| 100 000 | 90 000 | 1.362 | 0.866 | 0.64x | 0.9964 |
+
+Fitted over those four points, exact costs 0.0082 ms per 1k items while the graph costs 1.06 ms fixed
+plus 0.0032 ms per 1k, so **the two lines meet near 197k items** — past the specification's 100k
+world. Two sizes could not measure that (across runs the two-point fit produced both signs of slope
+for the exact baseline); four can.
+
+What the index does pay for is a *small* request. `efSearch` has to be at least `k`, so the graph's
+cost grows with how many neighbours are asked for while the matmul's does not. At 100k items:
+
+| candidates | efSearch | ANN ms/query | exact ms/query | ANN speedup | recall |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 64 | 0.055 | 0.850 | **15.5x** | 0.9940 |
+| 50 | 128 | 0.109 | 0.899 | 8.3x | 0.9942 |
+| 100 | 256 | 0.272 | 0.981 | 3.6x | 0.9973 |
+| **500 (this cascade)** | **768** | **1.393** | **0.855** | **0.61x** | 0.9964 |
+
+So: a 32-dimensional index over 100k items beats brute force by 15x when a request wants ten
+neighbours, and loses to it when the request wants five hundred — and this cascade wants five hundred,
+because stage 2 needs a candidate *set*, not a page. The index stays because it is what makes the
+recall/latency knob (the ladder's first step) and the recall canary mean anything, and because it is
+the structure a larger catalogue would need; it is not here because it is faster at the size measured.
 
 Slate reranking, 1500 held-out sessions, k=10. Each policy reorders exactly the items the logging
 policy showed, scored three ways — naively from clicks, with IPS weights, and against the world's
@@ -194,27 +226,37 @@ scores candidates with a noisy version of the true relevance logit, so it is a s
 than a straw man. Note also that the naive column ranks the logged policy first by a wide margin
 while ground truth puts it barely ahead — that gap is the position bias this repo measures.
 
-Full-catalogue top-10 over 150 users, scored against true relevance:
+Full-catalogue top-10, scored against true relevance. Every row is averaged over the same 150 sampled
+users, the unservable `exact_rank` row included, and each row carries its own count — an earlier
+version of this table computed that row over 40 users under a header that claimed 150 for all of them,
+which made an unpaired comparison look like a paired one:
 
-| policy | NDCG@10 | intra-list sim | coverage | cold-item share | cold-user NDCG |
-|---|---:|---:|---:|---:|---:|
-| popularity | 0.3224 | 0.5429 | 0.0015 | 0.0000 | 0.2733 |
-| tower only | 0.6205 | 0.6276 | 0.0488 | 0.0440 | 0.4584 |
-| cascade (MMR off) | 0.6054 | 0.5025 | 0.0233 | 0.0676 | 0.4174 |
-| cascade (as served) | 0.6015 | 0.4970 | 0.0230 | 0.0663 | 0.4176 |
-| exact full-corpus ranking | 0.6264 | 0.4531 | 0.0189 | 0.2125 | 0.3741 |
+| policy | users | NDCG@10 | intra-list sim | coverage | cold-item share | cold-user NDCG (users) |
+|---|---:|---:|---:|---:|---:|---:|
+| popularity | 150 | 0.3224 | 0.5429 | 0.0015 | 0.0000 | 0.2733 (19) |
+| tower only | 150 | 0.6205 | 0.6276 | 0.0488 | 0.0440 | 0.4584 (19) |
+| cascade (MMR off) | 150 | 0.6100 | 0.5128 | 0.0228 | 0.0661 | 0.4125 (19) |
+| cascade (as served) | 150 | 0.6059 | 0.5062 | 0.0226 | 0.0648 | 0.4115 (19) |
+| exact full-corpus ranking | 150 | 0.6095 | 0.4828 | 0.0446 | 0.1513 | 0.3708 (19) |
 
-The cascade retains **0.9998** of the unservable exact-ranking upper bound (gap 0.0001), so its two
-approximations — a finite candidate set and an approximate search inside it — cost essentially
-nothing here. MMR and the category cap then cost 0.0038 NDCG and buy lower intra-list similarity and
-a higher share of cold items.
+**The candidate set costs nothing.** Scoring all 10k items with the same LambdaMART model gets 0.6095
+against the cascade's 0.6100 over the same 150 users — a gap of -0.0004, i.e. the cascade retains
+**1.0007** of the full-corpus ranking. Neither of its two approximations, a finite candidate set and an
+approximate search inside it, costs measurable quality here. `exact_rank` is a reference and not a
+ceiling: the same imperfect model scoring more items can land slightly *below* it on true relevance,
+and here it does. It is also a raw top-k by model score, with no MMR and no category cap, which is why
+its coverage and cold-item share are the highest in the table and its cold-user NDCG the lowest.
 
-**The reranker does not beat the tower on this protocol** (0.6054 against 0.6205), and the
-`exact_rank` row shows why: scoring every item in the catalogue with the same LambdaMART model gets
-0.6264, so the limit is the ranker, not the cascade. The ranker is trained on label-period slates
-the logging policy chose, which is the only supervision click data can honestly provide, and that
-distribution does not cover the full catalogue. It wins on the slate protocol, where it was trained,
-and ties the tower on the corpus protocol. Reported rather than smoothed over.
+**The reranker still does not beat the tower on this protocol** (0.6100 against 0.6205). Because the
+full-corpus ranking with the same model does not beat the tower either, the limit is the model rather
+than the cascade around it: the ranker is trained on label-period slates the logging policy chose,
+which is the only supervision click data can honestly provide, and that distribution does not cover
+the full catalogue. It wins on the slate protocol, where it was trained, and comes 0.0105 short of the
+tower on the corpus protocol. Reported rather than smoothed over; closing it needs candidate-aware
+negative mining, which is a Non-goal below.
+
+MMR and the category cap then cost 0.0041 NDCG and buy lower intra-list similarity (0.5062 against
+0.5128) and a higher share of cold items.
 
 Position bias, mean relevance per rank over non-randomized impressions:
 
@@ -255,52 +297,67 @@ Ablations:
 
 | knob | setting | effect |
 |---|---|---|
-| logQ correction | on / off | recall 0.9748 / 0.9827, corpus NDCG 0.6054 / 0.5933 — trades a little recall for ranking quality |
-| ranker labels | naive clicks / IPS weights / LightGBM unbiased | corpus NDCG 0.5672 / **0.6054** / 0.4709; slate NDCG truth 0.8237 / 0.8544 / 0.8722 |
-| MMR lambda | 1.0 / 0.7 / 0.4 | intra-list sim 0.5025 / 0.4970 / 0.4748; true relevance 0.5768 / 0.5744 / 0.5645 |
-| rerank depth | 50 / 100 / 150 / 250 / 500 | NDCG 0.6074 / 0.6100 / 0.6054 / 0.6055 / 0.5981 at 2.8 / 3.7 / 4.3 / 5.7 / 8.8 ms per request |
-| efSearch | 128 / 256 / 768 | NDCG 0.6059 / 0.6055 / 0.6054 |
+| logQ correction | on / off | recall 0.9748 / 0.9827, corpus NDCG 0.6100 / 0.5886 — trades a little recall for ranking quality |
+| ranker labels | naive clicks / IPS weights / LightGBM unbiased | corpus NDCG 0.5690 / **0.6100** / 0.4834; slate NDCG truth 0.8237 / 0.8544 / 0.8722 |
+| MMR lambda | 1.0 / 0.7 / 0.4 | intra-list sim 0.5128 / 0.5062 / 0.4871; true relevance 0.5835 / 0.5808 / 0.5666 |
+| rerank depth | 50 / **100 (default)** / 150 / 250 / 500 | NDCG 0.6074 / **0.6100** / 0.6054 / 0.6055 / 0.5981 at 2.97 / 3.96 / 4.65 / 6.30 / 9.38 ms per request |
+| efSearch | 128 / 256 / 768 | NDCG 0.6100 / 0.6100 / 0.6100 |
 
-Two of these are worth naming. LightGBM's unbiased lambdarank wins the slate metric by a wide margin
+Three of these are worth naming. LightGBM's unbiased lambdarank wins the slate metric by a wide margin
 and loses the corpus metric by an even wider one, which is why IPS weighting is the default and the
-unbiased variant is kept only as an ablation. And the cost/quality curve is flat past depth 100
-while cost is linear in depth: the default of 150 buys nothing over 100 at this scale and 500 is
-actively worse for 2.4x the cost.
+unbiased variant is kept only as an ablation.
+
+The depth curve peaks at 100 while cost stays linear in depth, so **the served default is rerank depth
+100**, not the 150 this repo first shipped: at this scale 100 is both better (0.6100 against 0.6054)
+and cheaper (3.96 ms against 4.65 ms), and 500 is worse for 2.4x the cost. The ablation row is the
+whole justification for the deviation, and the main tables above are measured at the new default.
+
+And efSearch does not move NDCG@10 between 128 and 768 at all, even though recall@500 moves from
+0.8057 to 0.9771: at depth 100 the reranker only ever sees the top of the candidate set, and a
+narrower search still finds that part of it. The recall a wide search buys is insurance for the users
+whose good items sit deeper, not average-case quality — which is why efSearch is the ladder's
+first and cheapest thing to give up.
 
 ### Served latency
 
 `uv run python tasks.py load` (`bench/bench_load.py --check`) — the repo's own `serve` entry
 point in a separate process, one uvicorn worker, one faiss thread, three client processes issuing
 requests at a fixed schedule (not closed-loop, so a slow response queues behind rather than delaying
-the next send). `small` bundle, candidate_k=500, efSearch=768, k=20, 50 ms budget. Printed
-"load thresholds met".
+the next send). `small` bundle, candidate_k=500, efSearch=768, rerank depth 100, k=20, 50 ms budget.
+Printed "load thresholds met"; the run is recorded in `bench/results/load.json`.
 
 | phase | target RPS | achieved | p50 ms | p95 ms | p99 ms | server p50 ms | errors | degraded | peak in-flight |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| nominal | 50 | 50.1 | 12.53 | 15.91 | **19.89** | 4.77 | 0 | 0.0% | 5 |
-| overload 2x | 100 | 100.0 | 16.21 | 24.93 | 30.60 | 5.60 | 0 | 0.0% | 6 |
-| saturate 4x | 200 | 200.0 | 23.59 | 49.71 | 75.80 | 7.35 | 0 | 0.1% | 12 |
+| nominal | 50 | 50.1 | 12.74 | 16.67 | **20.51** | 4.23 | 0 | 0.0% | 3 |
+| overload 2x | 100 | 100.0 | 16.99 | 26.26 | 36.09 | 5.23 | 0 | 0.0% | 6 |
+| saturate 4x | 200 | 200.0 | 28.59 | 88.42 | 124.72 | 8.70 | 0 | 0.1% | 18 |
 
-p99 at 50 RPS is **19.9 ms against a 50 ms SLO**, with zero errors. Across three clean runs on this
-machine the nominal p99 was 18.9, 19.9 and 21.9 ms; two earlier runs taken while the machine was also
-running the test suite measured 39.7 and 48.7 ms, which is the shape of a shared box rather than of
-the code.
+p99 at 50 RPS is **20.5 ms against a 50 ms SLO**, with zero errors. Across three clean runs on this
+machine in one sitting the nominal p99 was 18.1, 20.5 and 26.8 ms; earlier runs taken while the machine
+was also running the test suite measured 39.7 and 48.7 ms, which is the shape of a shared box rather
+than of the code.
 
 The `server p50 ms` column is the server's own view of the same requests — the queue wait it measured
-plus the time its stages took. At the nominal rate that is 4.8 ms against a client-observed 12.5 ms,
+plus the time its stages took. At the nominal rate that is 4.2 ms against a client-observed 12.7 ms,
 so most of what a client sees at low load is connection handling and the client's own event loop, not
 the cascade.
 
-That gap is also what makes the 4x phase hard to interpret, and the bench now says so out loud. At
-200 RPS three client processes are close to their own ceiling on six cores: in one of the three runs
-the phase achieved 145 of 200 RPS with a client p50 of 51 ms against a server-side p50 of 6.4 ms — a
-ratio of 8x, meaning the requests were queued in httpx waiting for a connection and the server never
-saw the offered concurrency. The bench flags such a phase as `harness-limited` and does **not** assert
-the shed-quality invariant for it, because the budget controller correctly saw nothing late to shed.
-That is a limit of the load generator, and it is reported rather than hidden.
+That gap is also what makes the 4x phase hard to interpret, and the bench says so out loud. At 200 RPS
+three client processes are close to their own ceiling on six cores. In the run above the phase held
+200.0 RPS with a client p50 of 28.6 ms against a server-side 8.7 ms; in two other runs on the same box
+the clients collapsed instead, achieving 142.7 and 103.6 of 200 RPS with client p50s of 35 ms and
+7 073 ms against server-side p50s of 7.5 ms and 3.6 ms — requests waiting inside httpx for a free
+connection while the server never saw the offered concurrency. The bench flags such a phase as
+`harness-limited` and does **not** assert the shed-quality invariant for it, because the budget
+controller correctly saw nothing late to shed. It compares the client's view with the server's at both
+the median *and* the 99th percentile, because a connection pool saturates at the tail first: the
+142.7 RPS run sat at 4.7x on the median, just under the 5x flag, while its p99 was 9 302 ms against a
+server-side tail in the tens of milliseconds. That is a limit of the load generator, and it is
+reported rather than hidden.
 
 The invariant CI does enforce is the one the design rests on, wherever the server is what fell behind:
-**whenever throughput falls behind the offered rate, the degraded-response rate must be non-zero.**
+**whenever throughput falls behind the offered rate, at least 10% of responses must be degraded**
+(`min_degraded_rate_when_behind` in `bench/thresholds.json`).
 Errors must be zero in every phase, and throughput must hold at the nominal rate. The ladder itself is
 tested directly rather than only through load: `tests/unit/test_budget.py` and
 `tests/unit/test_cascade.py` drive each of its three steps with starved budgets and with contention,
@@ -313,35 +370,47 @@ the flag and the counter over HTTP.
 call; single-machine numbers for spotting regressions, not performance claims. Printed
 "all micro-benchmarks within thresholds".
 
-| benchmark | runs | p50 (us) | p95 (us) |
-|---|---:|---:|---:|
-| redact_text_1kb | 2000 | 360.6 | 930.7 |
-| rate_limiter_check | 20000 | 1.8 | 2.0 |
-| drift_check_10k_vs_10k | 30 | 2373.3 | 3405.9 |
-| ann_search_top500_50k_items | 200 | 2450.2 | 3284.8 |
-| assemble_features_500_rows | 500 | 64.5 | 86.1 |
-| mmr_select_200_candidates | 200 | 730.8 | 2935.8 |
-| filter_seen_500_candidates | 2000 | 137.0 | 186.4 |
-| budget_plan_request | 5000 | 5.9 | 6.8 |
-| audit_append_fsync | 100 | 8200.8 | 9343.0 |
-| audit_verify_500_entries | 10 | 11989.1 | 12981.4 |
-| estimate_propensities_200k_rows | 20 | 534.6 | 661.4 |
+| benchmark | runs | p50 (us) | p95 (us) | calls/s |
+|---|---:|---:|---:|---:|
+| redact_text_1kb | 2000 | 351.3 | 603.2 | - |
+| rate_limiter_check | 20000 | 1.9 | 2.1 | - |
+| drift_check_10k_vs_10k | 30 | 2282.9 | 3426.9 | - |
+| ann_search_top500_50k_items | 200 | 1972.0 | 2919.5 | - |
+| assemble_features_500_rows | 500 | 65.5 | 95.6 | - |
+| mmr_select_200_candidates | 200 | 802.8 | 1442.5 | - |
+| filter_seen_500_candidates | 2000 | 138.2 | 194.7 | - |
+| budget_plan_request | 5000 | 6.0 | 6.9 | - |
+| ranker_predict_100_rows_1_thread | 60 | 1936.2 | 2517.7 | 492.2 |
+| ranker_predict_100_rows_8_threads_thread_local | 480 | 1988.1 | 4668.6 | 2363.1 |
+| ranker_predict_100_rows_8_threads_shared_mutex | 480 | 1987.4 | 55328.7 | 481.1 |
+| audit_append_fsync | 100 | 8566.4 | 11320.3 | - |
+| audit_verify_500_entries | 10 | 10587.0 | 11328.9 | - |
+| estimate_propensities_200k_rows | 20 | 524.3 | 869.4 | - |
 
-Three of these are worth a sentence. `audit_append_fsync` includes one `fsync` per entry, so it mostly
-measures the disk. `budget_plan_request` is the whole plan-a-request path at 5.9 us — about 0.04% of
+Four of these are worth a sentence. `audit_append_fsync` includes one `fsync` per entry, so it mostly
+measures the disk. `budget_plan_request` is the whole plan-a-request path at 6.0 us — about 0.01% of
 the 50 ms budget it protects, which is the argument for predicting rather than hoping.
+
+The three `ranker_predict` rows are why each serving thread parses its own booster. One caller alone
+sustains 492 predictions per second over 100 feature rows; eight callers with a booster each sustain
+2 363 (4.8x, on six cores); eight callers sharing one booster behind a `threading.Lock` sustain 481 —
+**the lock caps the whole pool at a single caller's throughput**, and its p95 is 55.3 ms against
+4.7 ms. The per-call median is nearly identical in all three (about 1.99 ms), which is why throughput
+is measured here at all: serialization does not show up in the median caller's latency. Only the
+single-caller row is gated by a threshold, because what a shared CI runner reports for contention
+depends on how many cores it has and who else is on them.
 
 And `mmr_select_200_candidates` used to be the worst tail in the repo: a p50 of 2.1 ms with a p95 that
 reached 29 ms, because the greedy loop re-sliced the selected columns of the similarity matrix on
 every pick — O(k^2 n) work and a fresh allocation each iteration. Carrying the similarity maximum
 forward with `np.maximum` instead makes it O(k n) with no per-iteration allocation, and took p50 to
-0.73 ms. The p95 still moves between 1.1 and 2.9 ms across runs on this box; that is the machine, and
-the threshold is set several times above it.
+0.73 ms (0.80 ms in the run above). The p95 still moves between 1.1 and 2.9 ms across runs on this
+box; that is the machine, and the threshold is set several times above it.
 
 ### Tests
 
-`uv run python tasks.py test`: **736 tests, 98% line and branch coverage** (floor 85%), whole suite
-in 84 s with the `ci` hypothesis profile. No test touches the network — an autouse fixture blocks
+`uv run python tasks.py test`: **750 tests, 98% line and branch coverage** (98.07%, floor 85%), whole
+suite in 71 s with the `ci` hypothesis profile. No test touches the network — an autouse fixture blocks
 every non-loopback socket, and nothing downloads a model or a dataset.
 
 ## Security
@@ -395,9 +464,18 @@ Threats, controls and the tests that prove them are in
 - **Beating a production recommender.** The world is synthetic, and its logging policy sees a noisy
   version of the truth. The point is the measurement apparatus and the cascade's engineering, not
   the absolute NDCG.
-- **A ranker that beats the tower on the full corpus.** Measured above; it does not at this scale,
-  and the exact-ranking row shows the limit is the ranker's training distribution rather than the
-  cascade. Fixing it would need supervision the click log cannot provide.
+- **A ranker that beats the tower on the full corpus.** Measured above; it does not at this scale, and
+  the exact full-corpus ranking with the same model does not either, so the limit is the model's
+  training distribution rather than the cascade. Closing it would mean mining negatives from the
+  *serving* candidate distribution — sampling the ANN candidates each user would actually be shown
+  and labelling them from the click log's implicit feedback — rather than the 20 extra negatives per
+  session this repo draws. That is a training-data change with its own bias questions, and it is out
+  of scope here; the ablation that would decide it is not run.
+- **Numbers at the specification's 50k x 100k world.** Every measured number here is the `small`
+  world (5k users, 10k items). `--scale full` is accepted by the CLI and by the benches, but it was
+  never run on the machine this repo was built on (six cores, about 2 GB free), so nothing in this
+  README is quoted from it and its runtime and memory are unknown. What the 100k-item measurements
+  above do cover is retrieval cost and recall, on a resampled catalogue of that size.
 - **Shilling resistance against aged accounts.** Tenure weighting saturates at the trust threshold,
   so 200 accounts with four sessions each defeat it (measured above). Rate limiting, account-age
   gates and graph-based detection are out of scope.

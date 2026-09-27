@@ -52,16 +52,16 @@ the `small` world:
 
 | labels | corpus NDCG@10 | slate NDCG truth | slate NDCG naive | `tower_score` gain share |
 |---|---:|---:|---:|---:|
-| raw clicks | 0.5672 | 0.8237 | 0.6933 | 0.135 |
-| **IPS weights** | **0.6054** | 0.8544 | 0.6908 | 0.225 |
-| LightGBM unbiased | 0.4709 | **0.8722** | 0.5396 | 0.140 |
+| raw clicks | 0.5690 | 0.8237 | 0.6933 | 0.135 |
+| **IPS weights** | **0.6100** | 0.8544 | 0.6908 | 0.225 |
+| LightGBM unbiased | 0.4834 | **0.8722** | 0.5396 | 0.140 |
 
-- IPS weighting is worth **+0.038 corpus NDCG** over raw clicks (0.5672 to 0.6054), and +0.031 on the
+- IPS weighting is worth **+0.041 corpus NDCG** over raw clicks (0.5690 to 0.6100), and +0.031 on the
   slate metric. It also raises the share of the model's total gain attributed to `tower_score` from
   0.135 to 0.225, which is the mechanism made visible: with the position bias divided out, the
   relevance-carrying feature earns more of the splits and the popularity-carrying features earn fewer.
 - **LightGBM's unbiased lambdarank wins the slate metric by the largest margin of the three and loses
-  the corpus metric by an even larger one** (0.4709, worse than raw clicks). The two metrics disagree
+  the corpus metric by an even larger one** (0.4834, worse than raw clicks). The two metrics disagree
   because they ask different questions: the slate protocol only ever scores items the logging policy
   chose, and a model that has absorbed a position correction fitted *on that same policy's slates* is
   very good at reordering them and has learned something that does not generalize to the catalogue.
@@ -76,11 +76,11 @@ the `small` world:
   (1.024 against 1.0) so a broken estimator shows up as a metric, not as a slow quality drift.
 - Clipping at 20 leaves residual bias at the bottom of the page. The bench reports the remaining
   per-rank error (0.0373 against a naive 0.2513) rather than claiming the correction is exact.
-- **The correction does not make the reranker beat the tower on the full corpus** (0.6054 against
+- **The correction does not make the reranker beat the tower on the full corpus** (0.6100 against
   0.6205). It closes a large part of the gap that raw clicks leave, and the remaining limitation is the
-  training distribution rather than the label treatment — the `exact_rank` upper bound of 0.6264 shows
-  the model itself, applied to every item, barely improves on the tower. That is recorded in the model
-  card's Caveats and in the README's Non-goals.
+  training distribution rather than the label treatment — the `exact_rank` row (0.6095 over the same
+  150 users) shows the model itself, applied to every item in the catalogue, does not beat the tower
+  either. That is recorded in the model card's Caveats and in the README's Non-goals.
 - Both alternatives stay in the code as `RankerConfig` flags with an ablation that exercises them, so
   the claim above is re-measured on every quality bench run rather than being a note about something
   that was once tried.
