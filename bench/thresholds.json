@@ -1,0 +1,73 @@
+{
+  "baseline": {
+    "redact_text_1kb": {
+      "p95_us": 3000
+    },
+    "rate_limiter_check": {
+      "p95_us": 50
+    },
+    "drift_check_10k_vs_10k": {
+      "p95_us": 40000
+    },
+    "ann_search_top500_50k_items": {
+      "p95_us": 20000
+    },
+    "assemble_features_500_rows": {
+      "p95_us": 2000
+    },
+    "mmr_select_200_candidates": {
+      "p95_us": 20000
+    },
+    "filter_seen_500_candidates": {
+      "p95_us": 2000
+    },
+    "budget_plan_request": {
+      "p95_us": 200
+    },
+    "audit_append_fsync": {
+      "p95_us": 60000
+    },
+    "audit_verify_500_entries": {
+      "p95_us": 400000
+    },
+    "estimate_propensities_200k_rows": {
+      "p95_us": 60000
+    }
+  },
+  "quality": {
+    "min_recall_at_default": 0.95,
+    "min_cascade_slate_ndcg_truth": 0.5,
+    "min_ndcg_margin_over": {
+      "popularity": 0.05,
+      "tower": 0.01
+    },
+    "min_corpus_ndcg": 0.2,
+    "min_corpus_ndcg_margin_over": {
+      "popularity": 0.15
+    },
+    "min_upper_bound_retained": 0.8,
+    "max_eta_error": 0.2,
+    "max_canary_cycles_to_detect": 1,
+    "min_position_bias_reduction": 0.5,
+    "min_advantage_bias_reduction": 0.15,
+    "shilling": {
+      "fresh_50": {
+        "min_robust_rank_after": 400.0,
+        "min_damping": 5.0
+      },
+      "fresh_200": {
+        "min_robust_rank_after": 200.0,
+        "min_damping": 3.0
+      }
+    }
+  },
+  "load": {
+    "max_p99_ms": 50.0,
+    "max_p50_ms": 25.0,
+    "max_error_rate": 0.0,
+    "max_degraded_rate_nominal": 0.05,
+    "min_achieved_rps_fraction": 0.95,
+    "keeps_up_rps_fraction": 0.9,
+    "min_degraded_rate_when_behind": 0.1
+  }
+}

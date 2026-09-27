@@ -1,0 +1,139 @@
+{
+  "machine": {
+    "cpu_count": 6,
+    "faiss_threads": 1,
+    "load_client_processes": 3,
+    "platform": "Windows-10-10.0.19045-SP0",
+    "processor": "Intel64 Family 6 Model 158 Stepping 10, GenuineIntel",
+    "python": "3.12.14",
+    "uvicorn_workers": 1
+  },
+  "report": {
+    "bundle_id": "86ab80bf6f5d35a0c75a89ef857c452297767d660261f5aebf09bb060f99be45",
+    "candidate_k": 500,
+    "clients": 3,
+    "ef_search": 768,
+    "k": 20,
+    "n_items": 10000,
+    "phases": [
+      {
+        "achieved_rps": 50.12,
+        "degraded": 0,
+        "degraded_rate": 0.0,
+        "degraded_reasons": {},
+        "error_rate": 0.0,
+        "errors": 0,
+        "harness_limited": false,
+        "harness_ratio": 2.77,
+        "latency_ms": {
+          "max": 35.07,
+          "mean": 14.022,
+          "p50": 13.754,
+          "p95": 17.139,
+          "p99": 18.901
+        },
+        "max_contention": 1.0,
+        "max_in_flight": 3,
+        "name": "nominal",
+        "requests": 750,
+        "reranked": 750,
+        "schedule_lag_ms": {
+          "max": 29.647,
+          "mean": 9.217,
+          "p50": 9.704,
+          "p95": 24.217,
+          "p99": 27.22
+        },
+        "seconds": 14.963,
+        "server_ms": {
+          "max": 9.998,
+          "mean": 5.315,
+          "p50": 4.971,
+          "p95": 7.114,
+          "p99": 8.009
+        },
+        "target_rps": 50.0
+      },
+      {
+        "achieved_rps": 100.06,
+        "degraded": 0,
+        "degraded_rate": 0.0,
+        "degraded_reasons": {},
+        "error_rate": 0.0,
+        "errors": 0,
+        "harness_limited": false,
+        "harness_ratio": 2.97,
+        "latency_ms": {
+          "max": 65.14,
+          "mean": 18.173,
+          "p50": 17.435,
+          "p95": 26.603,
+          "p99": 31.484
+        },
+        "max_contention": 1.0,
+        "max_in_flight": 6,
+        "name": "overload_2x",
+        "requests": 1500,
+        "reranked": 1500,
+        "schedule_lag_ms": {
+          "max": 31.38,
+          "mean": -3.104,
+          "p50": -2.849,
+          "p95": 17.264,
+          "p99": 26.431
+        },
+        "seconds": 14.991,
+        "server_ms": {
+          "max": 45.235,
+          "mean": 6.423,
+          "p50": 5.862,
+          "p95": 10.388,
+          "p99": 14.198
+        },
+        "target_rps": 100.0
+      },
+      {
+        "achieved_rps": 183.67,
+        "degraded": 1,
+        "degraded_rate": 0.000333,
+        "degraded_reasons": {
+          "skip_rerank": 1
+        },
+        "error_rate": 0.0,
+        "errors": 0,
+        "harness_limited": false,
+        "harness_ratio": 3.37,
+        "latency_ms": {
+          "max": 3709.589,
+          "mean": 112.315,
+          "p50": 25.955,
+          "p95": 577.584,
+          "p99": 2132.004
+        },
+        "max_contention": 2.12,
+        "max_in_flight": 17,
+        "name": "saturate_4x",
+        "requests": 3000,
+        "reranked": 2999,
+        "schedule_lag_ms": {
+          "max": 138.847,
+          "mean": -4.414,
+          "p50": -7.86,
+          "p95": 32.571,
+          "p99": 77.469
+        },
+        "seconds": 16.333,
+        "server_ms": {
+          "max": 55.153,
+          "mean": 9.326,
+          "p50": 7.693,
+          "p95": 19.009,
+          "p99": 31.284
+        },
+        "target_rps": 200.0
+      }
+    ],
+    "request_budget_ms": 50.0,
+    "scale": "small"
+  }
+}

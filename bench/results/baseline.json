@@ -1,0 +1,65 @@
+{
+  "machine": {
+    "platform": "Windows-10-10.0.19045-SP0",
+    "python": "3.12.14",
+    "cpu_count": 6,
+    "processor": "Intel64 Family 6 Model 158 Stepping 10, GenuineIntel"
+  },
+  "results": {
+    "redact_text_1kb": {
+      "runs": 2000,
+      "p50_us": 360.6,
+      "p95_us": 930.7
+    },
+    "rate_limiter_check": {
+      "runs": 20000,
+      "p50_us": 1.8,
+      "p95_us": 2.0
+    },
+    "drift_check_10k_vs_10k": {
+      "runs": 30,
+      "p50_us": 2373.3,
+      "p95_us": 3405.9
+    },
+    "ann_search_top500_50k_items": {
+      "runs": 200,
+      "p50_us": 2450.2,
+      "p95_us": 3284.8
+    },
+    "assemble_features_500_rows": {
+      "runs": 500,
+      "p50_us": 64.5,
+      "p95_us": 86.1
+    },
+    "mmr_select_200_candidates": {
+      "runs": 200,
+      "p50_us": 730.8,
+      "p95_us": 2935.8
+    },
+    "filter_seen_500_candidates": {
+      "runs": 2000,
+      "p50_us": 137.0,
+      "p95_us": 186.4
+    },
+    "budget_plan_request": {
+      "runs": 5000,
+      "p50_us": 5.9,
+      "p95_us": 6.8
+    },
+    "audit_append_fsync": {
+      "runs": 100,
+      "p50_us": 8200.8,
+      "p95_us": 9343.0
+    },
+    "audit_verify_500_entries": {
+      "runs": 10,
+      "p50_us": 11989.1,
+      "p95_us": 12981.4
+    },
+    "estimate_propensities_200k_rows": {
+      "runs": 20,
+      "p50_us": 534.6,
+      "p95_us": 661.4
+    }
+  }
+}
