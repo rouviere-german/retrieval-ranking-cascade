@@ -25,9 +25,10 @@ Phases: a warm-up at the overload rate (long enough for every worker thread to p
 and for the cost estimators to settle - without it the *nominal* phase inherits a cold-start tail),
 then the nominal rate, then 2x, then 4x. The check that matters is not "does it degrade at 2x" -
 if the process keeps up at 2x then not degrading is the correct answer - but the invariant behind
-the whole design: **whenever throughput falls behind the offered rate, the degraded-response rate
-must be non-zero.** Falling behind while still planning full work is the failure mode a budget
-controller exists to prevent. Errors must be zero in every phase.
+the whole design: **whenever throughput falls behind the offered rate, a real share of the responses
+must be degraded** - at least ``min_degraded_rate_when_behind`` (10%) of them. Falling behind while
+still planning full work is the failure mode a budget controller exists to prevent. Errors must be
+zero in every phase.
 
 *Whose queue is it, though.* That invariant can only be asserted when the **server** is what fell
 behind, and at high multiples on a small box it often is not: the clients' connection pools
@@ -36,10 +37,12 @@ concurrency. A run like that reports seconds of client-observed latency while th
 of the same requests - the queue wait it measured plus the time its stages took - stays in the low
 milliseconds, and the budget controller is right not to degrade, because from inside the process
 nothing is late. Every response carries that server-side view, so the two are compared directly:
-when client-observed latency exceeds the server's own by more than ``HARNESS_LIMIT_RATIO``, the
-phase is reported as harness-limited and the shed-quality invariant is not asserted for it - the
-load test is measuring itself. Errors, throughput at the nominal rate and the latency SLO are
-still enforced.
+when client-observed latency exceeds the server's own by more than ``HARNESS_LIMIT_RATIO`` at
+either the median or the 99th percentile - the tail is where a connection pool saturates first - the
+phase is reported as harness-limited and the shed-quality invariant is not asserted for it: the load
+test is measuring itself. Nothing about the invariant itself is relaxed; a phase where the server is
+what fell behind carries the wait in its own numbers, so both ratios stay near 1. Errors, throughput
+at the nominal rate and the latency SLO are still enforced.
 
 Nothing leaves the machine: the server binds a loopback port and the clients only talk to it.
 """
@@ -63,6 +66,7 @@ from typing import Any
 import httpx
 import numpy as np
 
+from retrieval_ranking_cascade.core.config import Settings
 from retrieval_ranking_cascade.core.security import hash_api_key
 from retrieval_ranking_cascade.pipeline import TrainingConfig, train_bundle
 from retrieval_ranking_cascade.serving.bundle import load_bundle
@@ -80,9 +84,13 @@ PHASES: tuple[tuple[str, float], ...] = (
     ("saturate_4x", 4.0),
 )
 MEASURED = ("nominal", "overload_2x", "saturate_4x")
-# A phase whose client-observed p50 exceeds the server's own p50 by more than this factor was
+# A phase whose client-observed p50 or p99 exceeds the server's own by more than this factor was
 # bottlenecked outside the server; see the module docstring.
 HARNESS_LIMIT_RATIO = 5.0
+# The server here runs on its defaults, and stage 2's cost is linear in this one, so the run records
+# it. Read from the field default rather than from Settings() so the value in the report is the one
+# the repo ships and not whatever this shell has in its environment.
+RERANK_DEPTH = int(Settings.model_fields["rerank_depth"].default)
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -114,9 +122,26 @@ class PhaseResult:
 
     @property
     def harness_ratio(self) -> float:
-        """Client-observed p50 divided by the server's own p50 for the same requests."""
-        server = self.server_ms.get("p50", 0.0)
-        return self.latency_ms.get("p50", 0.0) / server if server > 0.0 else 1.0
+        """How far client-observed latency runs above the server's own view of the same requests.
+
+        The median alone is not enough. A client connection pool saturates at the tail first: some
+        requests sit in httpx waiting for a free connection for seconds while the median still gets
+        one quickly, which is how a phase can show a client p95 in the seconds against a server-side
+        p95 in the tens of milliseconds and still look nearly healthy at p50. Both percentiles are
+        compared and the larger ratio wins: either one far above 1 means the queue that produced the
+        latency was not the server's.
+
+        The asymmetry is safe: when the *server* is the bottleneck its own numbers include the wait
+        (``queued_seconds`` is stamped on the event loop, before a worker thread picks the request
+        up), so both ratios stay near 1 and the phase is judged as server-limited, which is what the
+        shed-quality invariant is asserted against.
+        """
+        ratios = [
+            self.latency_ms.get(percentile, 0.0) / self.server_ms[percentile]
+            for percentile in ("p50", "p99")
+            if self.server_ms.get(percentile, 0.0) > 0.0
+        ]
+        return max(ratios) if ratios else 1.0
 
     @property
     def harness_limited(self) -> bool:
@@ -479,6 +504,7 @@ def run(
         "n_items": bundle.n_items,
         "candidate_k": info["candidate_k"],
         "ef_search": int(info["hnsw"]["ef_search"]),
+        "rerank_depth": RERANK_DEPTH,
         "k": k,
         "clients": clients,
         "request_budget_ms": 50.0,
@@ -494,7 +520,8 @@ def check_thresholds(report: dict[str, Any], *, relax_latency: bool = False) -> 
     is slower, shares its cores with other tenants, and has no fixed clock; asserting 50 ms there
     would either be flaky or be a limit so loose it asserts nothing. The machine-independent
     invariants are still enforced in both modes: zero errors, throughput held at the nominal rate,
-    and a non-zero degraded rate whenever throughput falls behind the offered one.
+    and a degraded rate of at least ``min_degraded_rate_when_behind`` whenever the server falls
+    behind the offered rate.
     """
     limits = json.loads(THRESHOLDS.read_text(encoding="utf-8"))["load"]
     problems: list[str] = []
@@ -529,9 +556,10 @@ def check_thresholds(report: dict[str, Any], *, relax_latency: bool = False) -> 
             # controller saw nothing late to shed. Reported, not asserted.
             print(
                 f"NOTE: {name} fell behind ({phase['achieved_rps']:.1f} of "
-                f"{phase['target_rps']:.0f} RPS) but is harness-limited (client p50 "
-                f"{phase['latency_ms']['p50']:.1f} ms against a server-side p50 of "
-                f"{phase['server_ms']['p50']:.1f} ms, ratio "
+                f"{phase['target_rps']:.0f} RPS) but is harness-limited (client "
+                f"p50/p99 {phase['latency_ms']['p50']:.1f}/{phase['latency_ms']['p99']:.1f} ms "
+                f"against a server-side {phase['server_ms']['p50']:.1f}/"
+                f"{phase['server_ms']['p99']:.1f} ms, worst ratio "
                 f"{phase['harness_ratio']:.1f}x): the shed-quality invariant is not "
                 f"asserted for this phase."
             )
@@ -592,7 +620,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"\nbundle {report['bundle_id'][:12]} ({report['scale']}, {report['n_items']} items), "
-        f"candidate_k={report['candidate_k']}, efSearch={report['ef_search']}, k={report['k']}, "
+        f"candidate_k={report['candidate_k']}, efSearch={report['ef_search']}, "
+        f"rerankDepth={report['rerank_depth']}, k={report['k']}, "
         f"budget {report['request_budget_ms']} ms, {report['clients']} client processes\n"
     )
     print(

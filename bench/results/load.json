@@ -9,7 +9,7 @@
     "uvicorn_workers": 1
   },
   "report": {
-    "bundle_id": "86ab80bf6f5d35a0c75a89ef857c452297767d660261f5aebf09bb060f99be45",
+    "bundle_id": "cccb6e967772e0f42a6b62c6e8f1df0c7c2d96995b198b6f2ea8bf6dba509957",
     "candidate_k": 500,
     "clients": 3,
     "ef_search": 768,
@@ -17,20 +17,20 @@
     "n_items": 10000,
     "phases": [
       {
-        "achieved_rps": 50.12,
+        "achieved_rps": 50.11,
         "degraded": 0,
         "degraded_rate": 0.0,
         "degraded_reasons": {},
         "error_rate": 0.0,
         "errors": 0,
         "harness_limited": false,
-        "harness_ratio": 2.77,
+        "harness_ratio": 3.01,
         "latency_ms": {
-          "max": 35.07,
-          "mean": 14.022,
-          "p50": 13.754,
-          "p95": 17.139,
-          "p99": 18.901
+          "max": 25.9,
+          "mean": 13.045,
+          "p50": 12.735,
+          "p95": 16.671,
+          "p99": 20.508
         },
         "max_contention": 1.0,
         "max_in_flight": 3,
@@ -38,37 +38,37 @@
         "requests": 750,
         "reranked": 750,
         "schedule_lag_ms": {
-          "max": 29.647,
-          "mean": 9.217,
-          "p50": 9.704,
-          "p95": 24.217,
-          "p99": 27.22
+          "max": 28.563,
+          "mean": 8.005,
+          "p50": 8.093,
+          "p95": 19.954,
+          "p99": 24.389
         },
-        "seconds": 14.963,
+        "seconds": 14.967,
         "server_ms": {
-          "max": 9.998,
-          "mean": 5.315,
-          "p50": 4.971,
-          "p95": 7.114,
-          "p99": 8.009
+          "max": 9.452,
+          "mean": 4.583,
+          "p50": 4.227,
+          "p95": 6.225,
+          "p99": 7.74
         },
         "target_rps": 50.0
       },
       {
-        "achieved_rps": 100.06,
+        "achieved_rps": 99.98,
         "degraded": 0,
         "degraded_rate": 0.0,
         "degraded_reasons": {},
         "error_rate": 0.0,
         "errors": 0,
         "harness_limited": false,
-        "harness_ratio": 2.97,
+        "harness_ratio": 3.25,
         "latency_ms": {
-          "max": 65.14,
-          "mean": 18.173,
-          "p50": 17.435,
-          "p95": 26.603,
-          "p99": 31.484
+          "max": 58.616,
+          "mean": 17.847,
+          "p50": 16.987,
+          "p95": 26.26,
+          "p99": 36.085
         },
         "max_contention": 1.0,
         "max_in_flight": 6,
@@ -76,64 +76,65 @@
         "requests": 1500,
         "reranked": 1500,
         "schedule_lag_ms": {
-          "max": 31.38,
-          "mean": -3.104,
-          "p50": -2.849,
-          "p95": 17.264,
-          "p99": 26.431
+          "max": 29.572,
+          "mean": -4.843,
+          "p50": -4.77,
+          "p95": 15.53,
+          "p99": 24.473
         },
-        "seconds": 14.991,
+        "seconds": 15.003,
         "server_ms": {
-          "max": 45.235,
-          "mean": 6.423,
-          "p50": 5.862,
-          "p95": 10.388,
-          "p99": 14.198
+          "max": 20.194,
+          "mean": 5.751,
+          "p50": 5.229,
+          "p95": 9.937,
+          "p99": 13.069
         },
         "target_rps": 100.0
       },
       {
-        "achieved_rps": 183.67,
-        "degraded": 1,
-        "degraded_rate": 0.000333,
+        "achieved_rps": 200.04,
+        "degraded": 4,
+        "degraded_rate": 0.001333,
         "degraded_reasons": {
-          "skip_rerank": 1
+          "lower_rerank_depth": 4
         },
         "error_rate": 0.0,
         "errors": 0,
         "harness_limited": false,
-        "harness_ratio": 3.37,
+        "harness_ratio": 3.29,
         "latency_ms": {
-          "max": 3709.589,
-          "mean": 112.315,
-          "p50": 25.955,
-          "p95": 577.584,
-          "p99": 2132.004
+          "max": 214.27,
+          "mean": 37.653,
+          "p50": 28.593,
+          "p95": 88.423,
+          "p99": 124.722
         },
-        "max_contention": 2.12,
-        "max_in_flight": 17,
+        "max_contention": 2.25,
+        "max_in_flight": 18,
         "name": "saturate_4x",
         "requests": 3000,
-        "reranked": 2999,
+        "reranked": 3000,
         "schedule_lag_ms": {
-          "max": 138.847,
-          "mean": -4.414,
-          "p50": -7.86,
-          "p95": 32.571,
-          "p99": 77.469
+          "max": 49.553,
+          "mean": -6.357,
+          "p50": -7.016,
+          "p95": 12.105,
+          "p99": 23.426
         },
-        "seconds": 16.333,
+        "seconds": 14.997,
         "server_ms": {
-          "max": 55.153,
-          "mean": 9.326,
-          "p50": 7.693,
-          "p95": 19.009,
-          "p99": 31.284
+          "max": 56.88,
+          "mean": 11.037,
+          "p50": 8.703,
+          "p95": 25.703,
+          "p99": 38.274
         },
         "target_rps": 200.0
       }
     ],
     "request_budget_ms": 50.0,
+    "rerank_depth": 100,
     "scale": "small"
   }
 }
