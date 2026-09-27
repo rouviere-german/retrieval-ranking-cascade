@@ -220,9 +220,14 @@ class Ranker:
 
     Serving is multi-threaded, so each thread gets its own parsed ``Booster`` built from the same
     model text, held in a :class:`threading.local`. The alternative - one shared booster behind a
-    mutex - serializes stage 2 and was measured at roughly 4.5x the per-call latency under eight
-    concurrent callers (``bench/bench_baseline.py::bench_ranker_predict_threads``). A parsed copy of
-    a 200-tree model is a few hundred kilobytes, which is the price of that.
+    mutex - serializes stage 2: measured over 100 feature rows with eight concurrent callers, a
+    booster per thread sustained 2363.1 predictions per second against 481.1 behind a lock, which is
+    4.9x - and 481.1 is what a *single* caller sustains alone (492.2), so the lock caps the pool at
+    one thread's throughput. Its p95 was 55.3 ms against 4.7 ms. The per-call median is nearly
+    identical either way (1.99 ms), which is why the benchmark reports throughput
+    (``bench/bench_baseline.py::bench_ranker_predict_threads``; the numbers above are the run in
+    ``bench/results/baseline.json``). A parsed copy of a 200-tree model is a few hundred kilobytes,
+    which is the price of that.
     """
 
     def __init__(self, booster: Any) -> None:

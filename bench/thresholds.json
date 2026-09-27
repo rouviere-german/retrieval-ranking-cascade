@@ -24,6 +24,9 @@
     "budget_plan_request": {
       "p95_us": 200
     },
+    "ranker_predict_100_rows_1_thread": {
+      "p95_us": 30000
+    },
     "audit_append_fsync": {
       "p95_us": 60000
     },

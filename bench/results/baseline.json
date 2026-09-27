@@ -8,58 +8,76 @@
   "results": {
     "redact_text_1kb": {
       "runs": 2000,
-      "p50_us": 360.6,
-      "p95_us": 930.7
+      "p50_us": 351.3,
+      "p95_us": 603.2
     },
     "rate_limiter_check": {
       "runs": 20000,
-      "p50_us": 1.8,
-      "p95_us": 2.0
+      "p50_us": 1.9,
+      "p95_us": 2.1
     },
     "drift_check_10k_vs_10k": {
       "runs": 30,
-      "p50_us": 2373.3,
-      "p95_us": 3405.9
+      "p50_us": 2282.9,
+      "p95_us": 3426.9
     },
     "ann_search_top500_50k_items": {
       "runs": 200,
-      "p50_us": 2450.2,
-      "p95_us": 3284.8
+      "p50_us": 1972.0,
+      "p95_us": 2919.5
     },
     "assemble_features_500_rows": {
       "runs": 500,
-      "p50_us": 64.5,
-      "p95_us": 86.1
+      "p50_us": 65.5,
+      "p95_us": 95.6
     },
     "mmr_select_200_candidates": {
       "runs": 200,
-      "p50_us": 730.8,
-      "p95_us": 2935.8
+      "p50_us": 802.8,
+      "p95_us": 1442.5
     },
     "filter_seen_500_candidates": {
       "runs": 2000,
-      "p50_us": 137.0,
-      "p95_us": 186.4
+      "p50_us": 138.2,
+      "p95_us": 194.7
     },
     "budget_plan_request": {
       "runs": 5000,
-      "p50_us": 5.9,
-      "p95_us": 6.8
+      "p50_us": 6.0,
+      "p95_us": 6.9
+    },
+    "ranker_predict_100_rows_1_thread": {
+      "runs": 60,
+      "p50_us": 1936.2,
+      "p95_us": 2517.7,
+      "calls_per_second": 492.2
+    },
+    "ranker_predict_100_rows_8_threads_thread_local": {
+      "runs": 480,
+      "p50_us": 1988.1,
+      "p95_us": 4668.6,
+      "calls_per_second": 2363.1
+    },
+    "ranker_predict_100_rows_8_threads_shared_mutex": {
+      "runs": 480,
+      "p50_us": 1987.4,
+      "p95_us": 55328.7,
+      "calls_per_second": 481.1
     },
     "audit_append_fsync": {
       "runs": 100,
-      "p50_us": 8200.8,
-      "p95_us": 9343.0
+      "p50_us": 8566.4,
+      "p95_us": 11320.3
     },
     "audit_verify_500_entries": {
       "runs": 10,
-      "p50_us": 11989.1,
-      "p95_us": 12981.4
+      "p50_us": 10587.0,
+      "p95_us": 11328.9
     },
     "estimate_propensities_200k_rows": {
       "runs": 20,
-      "p50_us": 534.6,
-      "p95_us": 661.4
+      "p50_us": 524.3,
+      "p95_us": 869.4
     }
   }
 }

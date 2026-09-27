@@ -20,11 +20,14 @@ import os
 import platform
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 
+import lightgbm as lgb
 import numpy as np
+import numpy.typing as npt
 
 from retrieval_ranking_cascade.core.ratelimit import RateLimiter
 from retrieval_ranking_cascade.core.redaction import redact_text
@@ -38,9 +41,11 @@ from retrieval_ranking_cascade.evaluation.propensity import (
 )
 from retrieval_ranking_cascade.ml.drift import DriftMonitor
 from retrieval_ranking_cascade.ranking.features import (
+    FEATURE_NAMES,
     assemble_features,
     build_snapshot,
 )
+from retrieval_ranking_cascade.ranking.ranker import Ranker, RankerConfig, RankerDataset
 from retrieval_ranking_cascade.ranking.rules import filter_seen, mmr_select
 from retrieval_ranking_cascade.retrieval.ann import HnswIndex, HnswParams
 from retrieval_ranking_cascade.serving.audit import AuditLog, verify_file
@@ -150,6 +155,113 @@ def bench_audit_verify(workdir: Path) -> dict[str, float]:
     return _timed(lambda: verify_file(path), runs=10, warmup=1)
 
 
+def _synthetic_ranker(rows: int = 4_000, queries: int = 200) -> Ranker:
+    """A 200-tree lambdarank model over random features: shaped like the real one, quick to fit.
+
+    This bench measures ``predict`` under concurrency, which depends on the tree count and the row
+    count and not on what the model learned, so the pipeline's world is not needed here.
+    """
+    rng = np.random.default_rng(0)
+    features = rng.normal(size=(rows, len(FEATURE_NAMES))).astype(np.float32)
+    group = np.full(queries, rows // queries, dtype=np.int32)
+    labels = (rng.random(rows) < 0.2).astype(np.int32)
+    dataset = RankerDataset(
+        features=features,
+        labels=labels,
+        groups=group,
+        positions=np.tile(np.arange(1, rows // queries + 1, dtype=np.int32), queries),
+        weights=np.ones(rows, dtype=np.float64),
+        users=np.repeat(np.arange(queries, dtype=np.int32), rows // queries),
+        items=rng.integers(0, 10_000, size=rows).astype(np.int32),
+    )
+    return Ranker.train(dataset, RankerConfig(ips_weights=False, threads=4))
+
+
+def _concurrent_predict(
+    call: Callable[[npt.NDArray[np.float32]], object],
+    features: npt.NDArray[np.float32],
+    *,
+    threads: int,
+    calls: int,
+) -> dict[str, float]:
+    """Latency and aggregate throughput of ``threads`` callers hammering ``call`` at once.
+
+    Both are needed: a lock leaves the median caller's own latency almost untouched while it caps
+    what the pool as a whole can do, so throughput is where serialization shows up first.
+    """
+    barrier = threading.Barrier(threads)
+    samples: list[list[float]] = [[] for _ in range(threads)]
+    spans: list[tuple[float, float]] = [(0.0, 0.0)] * threads
+
+    def worker(slot: int) -> None:
+        for _ in range(3):  # warm up this thread's own state (a parsed booster, page faults)
+            call(features)
+        barrier.wait()  # every thread measures while every other thread is also working
+        started = time.perf_counter()
+        for _ in range(calls):
+            began = time.perf_counter()
+            call(features)
+            samples[slot].append((time.perf_counter() - began) * 1e6)
+        spans[slot] = (started, time.perf_counter())
+
+    workers = [threading.Thread(target=worker, args=(slot,)) for slot in range(threads)]
+    for thread in workers:
+        thread.start()
+    for thread in workers:
+        thread.join()
+    micros = np.concatenate([np.asarray(slot, dtype=np.float64) for slot in samples])
+    elapsed = max(end for _, end in spans) - min(start for start, _ in spans)
+    return {
+        "runs": int(micros.size),
+        "p50_us": round(float(np.percentile(micros, 50)), 1),
+        "p95_us": round(float(np.percentile(micros, 95)), 1),
+        "calls_per_second": round(float(micros.size) / elapsed, 1) if elapsed > 0 else 0.0,
+    }
+
+
+def bench_ranker_predict_threads(
+    rows: int = 100, threads: int = 8, calls: int = 60
+) -> dict[str, dict[str, float]]:
+    """``Ranker.predict`` under concurrency: a booster per thread against one behind a mutex.
+
+    Serving runs stage 2 on a pool of ``server_threads`` (8 by default) worker threads. ``Ranker``
+    gives each thread its own parsed booster built from the shared model text (a
+    ``threading.local``); the alternative is one booster guarded by a lock. Three variants are
+    measured over the same feature matrix and the same model, so ``ranking/ranker.py`` can quote a
+    measurement instead of an intuition: one caller alone (the reference), eight callers with a
+    booster each, and eight callers sharing one booster behind a ``threading.Lock``.
+
+    ``rows`` is one request's worth of feature rows at the default ``rerank_depth``. It is a literal
+    rather than a read of ``Settings``, so the benchmark's name - and with it its threshold in
+    ``bench/thresholds.json`` - stays stable if that default is ever retuned.
+
+    Only the single-caller variant is gated by a threshold. The other two measure contention, and
+    what a shared CI runner reports for that depends on how many cores it has and who else is on
+    them; they are recorded for reading, not for failing a build.
+    """
+    ranker = _synthetic_ranker()
+    rng = np.random.default_rng(1)
+    features = rng.normal(size=(rows, len(FEATURE_NAMES))).astype(np.float32)
+    # The control: one booster, parsed once from the same model text, shared behind a lock.
+    shared = lgb.Booster(model_str=ranker.to_text())
+    lock = threading.Lock()
+
+    def under_mutex(batch: npt.NDArray[np.float32]) -> object:
+        with lock:
+            return shared.predict(batch, num_threads=1)
+
+    prefix = f"ranker_predict_{rows}_rows"
+    return {
+        f"{prefix}_1_thread": _concurrent_predict(ranker.predict, features, threads=1, calls=calls),
+        f"{prefix}_{threads}_threads_thread_local": _concurrent_predict(
+            ranker.predict, features, threads=threads, calls=calls
+        ),
+        f"{prefix}_{threads}_threads_shared_mutex": _concurrent_predict(
+            under_mutex, features, threads=threads, calls=calls
+        ),
+    }
+
+
 def bench_propensity() -> dict[str, float]:
     config = world_config("small")
     _, _, interactions = generate(config)
@@ -179,6 +291,7 @@ def run() -> dict[str, dict[str, float]]:
             "mmr_select_200_candidates": bench_mmr(),
             "filter_seen_500_candidates": bench_filter_seen(),
             "budget_plan_request": bench_budget_plan(),
+            **bench_ranker_predict_threads(),
             "audit_append_fsync": bench_audit_append(workdir),
             "audit_verify_500_entries": bench_audit_verify(workdir),
             "estimate_propensities_200k_rows": bench_propensity(),
@@ -211,10 +324,15 @@ def main(argv: list[str] | None = None) -> int:
     RESULTS.write_text(
         json.dumps({"machine": machine(), "results": results}, indent=2) + "\n", encoding="utf-8"
     )
-    print("| benchmark | runs | p50 (us) | p95 (us) |")
-    print("|---|---:|---:|---:|")
+    print("| benchmark | runs | p50 (us) | p95 (us) | calls/s |")
+    print("|---|---:|---:|---:|---:|")
     for name, stats in results.items():
-        print(f"| {name} | {stats['runs']:.0f} | {stats['p50_us']} | {stats['p95_us']} |")
+        # Throughput is only meaningful where several callers were measured at once.
+        throughput = stats.get("calls_per_second")
+        print(
+            f"| {name} | {stats['runs']:.0f} | {stats['p50_us']} | {stats['p95_us']} | "
+            f"{'-' if throughput is None else f'{throughput:.1f}'} |"
+        )
     if args.check:
         problems = check_thresholds(results)
         for problem in problems:
