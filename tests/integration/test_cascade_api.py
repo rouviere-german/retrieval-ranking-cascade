@@ -24,7 +24,7 @@ from retrieval_ranking_cascade.serving.api import (
 )
 from retrieval_ranking_cascade.serving.audit import AuditLog
 from retrieval_ranking_cascade.serving.budget import BudgetController, CostEstimator
-from retrieval_ranking_cascade.serving.bundle import load_bundle
+from retrieval_ranking_cascade.serving.bundle import Bundle, load_bundle
 from retrieval_ranking_cascade.serving.metrics import create_cascade_metrics
 
 pytestmark = pytest.mark.integration
@@ -46,6 +46,9 @@ def _settings(tmp_path: Path, bundle_dir: Path, **overrides: Any) -> Settings:
         ],
         "admin_api_key_sha256": [hash_api_key(ADMIN_KEY)],
         "bundle_dir": bundle_dir,
+        # The shared pytest basetemp holds both the session bundle and every per-test copy of it,
+        # so this is the smallest root that covers what these tests legitimately load.
+        "bundle_root": tmp_path.parent,
         "audit_log_path": tmp_path / "audit" / "admin.jsonl",
         "rate_limit_per_second": 10_000.0,
         "rate_limit_burst": 10_000,
@@ -335,7 +338,7 @@ def test_the_feedback_schema_rejects_malformed_bodies(
 def test_one_noisy_source_cannot_flood_the_statistics(
     tiny_bundle_dir: Path, tmp_path: Path
 ) -> None:
-    """Item popularity is computed from feedback, so ingestion is limited per source."""
+    """A noisy ``source`` is throttled without taking a quiet one's budget with it."""
     settings = _settings(
         tmp_path,
         tiny_bundle_dir,
@@ -385,6 +388,59 @@ def test_a_rate_limited_source_is_told_when_to_retry(tiny_bundle_dir: Path, tmp_
         limited = client.post("/v1/feedback", json=body, headers=SERVING)
     assert limited.status_code == 429
     assert "Retry-After" in limited.headers
+
+
+def test_rotating_the_source_does_not_buy_a_client_more_feedback_budget(
+    tiny_bundle_dir: Path, tmp_path: Path
+) -> None:
+    """``source`` is chosen by the caller, so the bound on a client is keyed on its API key."""
+    settings = _settings(
+        tmp_path,
+        tiny_bundle_dir,
+        feedback_rate_limit_per_second=1.0,
+        feedback_rate_limit_burst=1,
+        feedback_client_rate_multiplier=4.0,
+    )
+    metrics = create_cascade_metrics(CollectorRegistry())
+    service = build_service(load_bundle(tiny_bundle_dir), settings, metrics)
+    events = [{"user_id": 1, "item_id": 2, "position": 1, "clicked": 1}]
+    with TestClient(create_cascade_app(service), raise_server_exceptions=False) as client:
+        codes = [
+            client.post(
+                "/v1/feedback", json={"source": source, "events": events}, headers=SERVING
+            ).status_code
+            for source in feedback_sources(20, seed=6)
+        ]
+    assert codes[0] == 200
+    # Four tokens of per-key burst at 4/s: a fresh source cannot mint a fresh allowance.
+    assert codes.count(200) <= 8
+    assert codes.count(429) >= 10
+    assert metrics.registry.get_sample_value(
+        "cascade_feedback_rejected_total", {"reason": "client_rate_limited"}
+    ) == pytest.approx(float(codes.count(429)))
+
+
+def test_two_api_keys_do_not_share_one_feedback_budget(
+    tiny_bundle_dir: Path, tmp_path: Path
+) -> None:
+    """The per-key bucket must bound a client without letting one client starve another."""
+    settings = _settings(
+        tmp_path,
+        tiny_bundle_dir,
+        feedback_rate_limit_per_second=1.0,
+        feedback_rate_limit_burst=1,
+        feedback_client_rate_multiplier=1.0,
+    )
+    service = build_service(
+        load_bundle(tiny_bundle_dir), settings, create_cascade_metrics(CollectorRegistry())
+    )
+    source = feedback_sources(1, seed=7)[0]
+    body = {"source": source, "events": [{"user_id": 1, "item_id": 2, "position": 1, "clicked": 1}]}
+    with TestClient(create_cascade_app(service), raise_server_exceptions=False) as client:
+        first = client.post("/v1/feedback", json=body, headers=SERVING).status_code
+        repeat = client.post("/v1/feedback", json=body, headers=SERVING).status_code
+        other = client.post("/v1/feedback", json=body, headers={"X-API-Key": OTHER_KEY}).status_code
+    assert (first, repeat, other) == (200, 429, 200)
 
 
 # --- introspection ---
@@ -519,6 +575,51 @@ def test_swapping_in_a_tampered_bundle_is_refused_and_the_refusal_is_audited(
     entries = AuditLog(service.settings.audit_log_path).read()
     assert entries[-1].action == "bundle_swap_rejected"
     assert entries[-1].details["error"] == "BundleIntegrityError"
+
+
+def test_a_bundle_directory_outside_the_root_is_refused_before_anything_is_loaded(
+    tiny_bundle_dir: Path, tmp_path: Path
+) -> None:
+    """A leaked admin key must not turn the loader into an arbitrary-path read probe."""
+
+    def never_called(directory: Path) -> Bundle:
+        raise AssertionError(f"load_bundle must not be reached for {directory}")
+
+    settings = _settings(tmp_path, tiny_bundle_dir, bundle_root=tmp_path / "allowed")
+    metrics = create_cascade_metrics(CollectorRegistry())
+    service = build_service(
+        load_bundle(tiny_bundle_dir), settings, metrics, bundle_loader=never_called
+    )
+    before = service.cascade.bundle.bundle_id
+    with TestClient(create_cascade_app(service), raise_server_exceptions=False) as client:
+        for outside in ("../../../../etc/passwd", str(tmp_path / "elsewhere"), "C:/Windows"):
+            response = client.post("/v1/admin/bundle", json={"directory": outside}, headers=ADMIN)
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "bundle_rejected"
+    assert service.cascade.bundle.bundle_id == before
+    entries = AuditLog(settings.audit_log_path).read()
+    assert [entry.action for entry in entries] == ["bundle_swap_rejected"] * 3
+    assert {entry.details["error"] for entry in entries} == {"outside_root"}
+    assert AuditLog(settings.audit_log_path).verify() == 3
+    assert metrics.registry.get_sample_value(
+        "cascade_admin_actions_total", {"action": "bundle_swap_rejected"}
+    ) == pytest.approx(3.0)
+
+
+def test_the_live_bundle_directory_stays_loadable_from_outside_the_root(
+    tiny_bundle_dir: Path, tmp_path: Path
+) -> None:
+    """Containment must not lock an operator out of reloading the bundle the process is serving."""
+    settings = _settings(tmp_path, tiny_bundle_dir, bundle_root=tmp_path / "allowed")
+    service = build_service(
+        load_bundle(tiny_bundle_dir), settings, create_cascade_metrics(CollectorRegistry())
+    )
+    with TestClient(create_cascade_app(service), raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/admin/bundle", json={"directory": str(tiny_bundle_dir)}, headers=ADMIN
+        )
+    assert response.status_code == 200
+    assert response.json()["action"] == "bundle_swap"
 
 
 def test_swapping_from_a_directory_that_does_not_exist_is_refused_and_audited(

@@ -89,12 +89,21 @@ truncate its tail; detecting that after the fact needs the head hash stored else
 | Request volume exhausts the process | Per-client token bucket with a bounded key table, and a body-size limit | `tests/unit/test_ratelimit.py::test_burst_is_admitted_then_refills_at_rate`, `tests/unit/test_ratelimit.py::test_tracked_keys_are_bounded`, `tests/integration/test_app.py::test_body_size_limit_applies_to_declared_and_streamed_bodies` |
 | Load pushes p99 past the budget | Per-stage budgets with a three-step degradation ladder driven by measured cost, queue time and in-flight contention; responses that lost quality are flagged and counted | `tests/unit/test_budget.py::test_a_tight_retrieval_budget_lowers_ef_search_first`, `tests/unit/test_budget.py::test_a_tight_ranking_budget_lowers_the_rerank_depth`, `tests/unit/test_budget.py::test_a_budget_that_cannot_fit_the_minimum_depth_skips_reranking_altogether`, `tests/unit/test_cascade.py::test_a_budget_too_small_for_the_reranker_returns_ann_order_flagged_degraded`, `bench/bench_load.py` |
 | The degradation ladder loops or degrades without bound | The ladder terminates at documented floors (`efSearch` 16, candidates 16, depth 32) and a plan never grows the request | `tests/unit/test_budget.py::test_the_ladder_stops_at_the_floors_even_when_nothing_fits`, `tests/unit/test_budget.py::test_a_retrieval_plan_never_grows_the_request_and_respects_the_floors` |
-| One feedback source floods the statistics | Per-source token bucket with `Retry-After`, independent of other sources | `tests/integration/test_cascade_api.py::test_one_noisy_source_cannot_flood_the_statistics`, `tests/integration/test_cascade_api.py::test_a_rate_limited_source_is_told_when_to_retry` |
+| One feedback client floods the endpoint | Two token buckets with `Retry-After`: one per `(key id, source)` so a noisy source does not spend a quiet one's budget, and one per authenticated key id — the caller picks `source`, so only the key-keyed bucket bounds a client | `tests/integration/test_cascade_api.py::test_one_noisy_source_cannot_flood_the_statistics`, `tests/integration/test_cascade_api.py::test_a_rate_limited_source_is_told_when_to_retry`, `tests/integration/test_cascade_api.py::test_rotating_the_source_does_not_buy_a_client_more_feedback_budget`, `tests/integration/test_cascade_api.py::test_two_api_keys_do_not_share_one_feedback_budget` |
 | A monitoring buffer grows with traffic | Ring buffers with a fixed capacity, and feature rows recomputed only for a sampled subset of responses | `tests/unit/test_monitoring.py::test_the_feature_buffer_is_bounded`, `tests/unit/test_monitoring.py::test_feature_rows_are_only_recomputed_for_a_sampled_subset` |
 
 **Residual risk.** The controller bounds *planned* work only; a stage that has started is never
 interrupted, so one pathological request can overshoot. Buckets and estimators are per process, so
 several replicas budget independently.
+
+Rate-limit state is also bounded by `max_keys` with LRU eviction, and an evicted key is readmitted
+with a *full* bucket — forgetting a key forgets that it was throttled
+(`tests/unit/test_ratelimit.py::test_an_evicted_key_is_readmitted_with_a_full_bucket`). This is only
+exploitable where a caller can churn keys: the HTTP limiter keys on the verified key digest or a
+hashed IP prefix, and the feedback limiter's caller-chosen `source` buckets live in a *separate*
+limiter from the per-key buckets, so churning sources cannot evict the bucket that bounds the
+client. Closing the gap outright needs a penalty set of recently throttled keys exempt from
+eviction, which is not implemented.
 
 ### Elevation of privilege
 

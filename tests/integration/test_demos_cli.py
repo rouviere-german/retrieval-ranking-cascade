@@ -86,6 +86,13 @@ def test_the_demo_shows_a_tampered_bundle_being_refused(
     assert demo_summary["bundle_swap_status"] == 200
 
 
+def test_the_demo_shows_a_bundle_path_outside_the_root_being_refused(
+    demo_summary: dict[str, Any],
+) -> None:
+    assert demo_summary["outside_root_bundle_status"] == 422
+    assert demo_summary["outside_root_audit_reason"] == "outside_root"
+
+
 def test_the_demo_verifies_the_audit_chain_and_then_breaks_it(
     demo_summary: dict[str, Any],
 ) -> None:

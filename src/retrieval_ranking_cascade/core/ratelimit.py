@@ -4,6 +4,17 @@ Each client key gets a bucket holding at most ``burst`` tokens that refills at `
 second, so over any interval of length T a key is admitted at most ``burst + rate * T`` times.
 State is per process and bounded by ``max_keys`` (least recently used keys are evicted); a
 multi-replica deployment needs a shared store instead, which is a documented non-goal here.
+
+**Eviction readmits with a full bucket.** The bound on memory has a cost: a key whose bucket was
+empty and was then evicted starts again at ``burst`` tokens the next time it is seen, because the
+limiter keeps no memory of a key it has forgotten. That only matters where an attacker can mint keys
+faster than ``max_keys``, so callers must not let an attacker choose the key. The HTTP limiter keys
+on the verified API-key digest or a hashed IP prefix (``core.middleware``), neither of which a
+caller can churn. Where part of a key *is* caller-chosen - the feedback limiter's ``source`` - the
+bucket that bounds the client lives in its own limiter instance, so churn in one map cannot evict
+the other's entries (``serving.api.CascadeService._check_feedback_limits``). Keeping a penalty set
+of recently throttled keys exempt from eviction would close the gap outright; it is not implemented,
+and the residual risk is in ``docs/THREAT_MODEL.md``.
 """
 
 from __future__ import annotations

@@ -42,6 +42,28 @@ def test_tracked_keys_are_bounded() -> None:
     assert len(limiter) == 2
 
 
+def test_an_evicted_key_is_readmitted_with_a_full_bucket() -> None:
+    """The documented cost of bounding memory: forgetting a key forgets that it was throttled.
+
+    This is why no limiter may be keyed on a value an attacker chooses freely (see the module
+    docstring and the DoS row of ``docs/THREAT_MODEL.md``).
+    """
+    limiter = RateLimiter(rate=0.001, burst=2, max_keys=4, clock=FakeClock())
+    assert [limiter.check("victim").allowed for _ in range(3)] == [True, True, False]
+    for filler in "abcdef":
+        limiter.check(filler)
+    assert len(limiter) == 4
+    assert limiter.check("victim").allowed
+
+
+def test_a_throttled_key_that_stays_in_the_map_is_not_reset_by_other_keys() -> None:
+    limiter = RateLimiter(rate=0.001, burst=1, max_keys=4, clock=FakeClock())
+    assert limiter.check("victim").allowed
+    for filler in "abc":
+        limiter.check(filler)
+    assert not limiter.check("victim").allowed
+
+
 def test_invalid_parameters_are_rejected() -> None:
     with pytest.raises(ValueError, match="positive"):
         TokenBucket(rate=0.0, capacity=1.0, now=0.0)

@@ -89,10 +89,21 @@ class Settings(BaseSettings):
     admin_api_key_sha256: Annotated[list[str], NoDecode] = Field(default_factory=list)
     feedback_rate_limit_per_second: float = Field(default=2.0, gt=0)
     feedback_rate_limit_burst: int = Field(default=20, ge=1)
+    # A caller picks its own ``source``, so the per-source bucket cannot bound a client on its own.
+    # The per-key bucket runs at this multiple of the per-source rate and burst: how many distinct
+    # sources one API key may keep busy at once.
+    feedback_client_rate_multiplier: float = Field(default=4.0, ge=1.0, le=1_000.0)
     audit_log_path: Path = Path("var/audit/admin.jsonl")
 
     # --- storage ---
     data_dir: Path = Path("var")
+    # Directories ``/v1/admin/bundle`` may load from. Defaults to ``data_dir``; the live
+    # ``bundle_dir`` is always allowed so a reload in place works wherever it lives.
+    bundle_root: Path | None = None
+
+    @property
+    def resolved_bundle_root(self) -> Path:
+        return (self.bundle_root or self.data_dir).resolve()
 
     @field_validator("api_key_sha256", "admin_api_key_sha256", mode="before")
     @classmethod

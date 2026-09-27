@@ -12,9 +12,13 @@ Security posture, in the order a request meets it:
 4. **admin scope** - ``/v1/admin/*`` additionally requires the key digest to appear in
    ``APP_ADMIN_API_KEY_SHA256``, and every privileged action is appended to a hash-chained audit
    log before it returns;
-5. **per-source feedback limits** - feedback is validated by its pandera contract and each
-   ``source`` gets its own token bucket, so one client cannot flood the statistics that item
-   popularity is computed from.
+5. **feedback limits** - feedback is validated by its pandera contract and metered by two token
+   buckets. ``source`` is a caller-chosen label, not an identity: it gets its own bucket so one
+   noisy source does not spend a quiet one's budget, but a client that rotates it would mint a
+   fresh bucket per request, so what bounds a *client* is a second bucket keyed on its
+   authenticated key id (``feedback_client_rate_multiplier`` times the per-source rate). Accepted
+   feedback only moves monitoring gauges - it never reaches the feature snapshot, the item
+   statistics the ranker uses or training (see ``serving.monitoring.record_feedback``).
 
 User ids never reach the logs or the audit chain in the clear: they are replaced by keyed,
 truncated digests (:class:`serving.audit.UserPseudonymizer`).
@@ -45,7 +49,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import numpy as np
 import pandas as pd
@@ -238,6 +242,16 @@ class CascadeService:
             settings.feedback_rate_limit_burst,
             max_keys=settings.rate_limit_max_clients,
         )
+        # A second limiter, not a second key in the first one: rotating ``source`` inserts entries
+        # into the per-source limiter, and an eviction there readmits an evicted key with a full
+        # bucket (see core.ratelimit). Keeping the per-key buckets in their own map means that
+        # churn can never hand a client a fresh client-level allowance.
+        multiplier = settings.feedback_client_rate_multiplier
+        self._feedback_client_limiter = RateLimiter(
+            settings.feedback_rate_limit_per_second * multiplier,
+            max(1, math.ceil(settings.feedback_rate_limit_burst * multiplier)),
+            max_keys=settings.rate_limit_max_clients,
+        )
         self._admin_lock = threading.Lock()
         self.bounds = _Bounds(
             max_k=settings.max_k,
@@ -331,16 +345,17 @@ class CascadeService:
 
     # --- feedback ---
 
-    def ingest(self, body: FeedbackRequest) -> FeedbackResponse:
-        decision = self._feedback_limiter.check(body.source)
-        if not decision.allowed:
-            self.metrics.feedback_rejected_total.labels(reason="rate_limited").inc()
-            raise AppError(
-                429,
-                "feedback_rate_limited",
-                "This feedback source is sending events too quickly.",
-                headers={"Retry-After": str(decision.retry_after_seconds)},
-            )
+    def ingest(self, principal: Principal, body: FeedbackRequest) -> FeedbackResponse:
+        """Validate and record one feedback batch, under two token buckets.
+
+        ``source`` is picked by the caller and is not an identity, so it cannot be the thing that
+        bounds a client: a client that rotates it would mint a fresh bucket per request. It still
+        earns its own bucket, because that is what keeps one noisy source from spending a quiet
+        one's budget under the same key. The bound on the *client* is the second bucket, keyed on
+        the authenticated key id. The per-source bucket is checked first, so a request that is
+        already refused does not spend a client token.
+        """
+        self._check_feedback_limits(principal, body.source)
         bundle = self.cascade.bundle
         frame = pd.DataFrame(
             [
@@ -375,6 +390,22 @@ class CascadeService:
         ]
         accepted = self.monitor.record_feedback(events)
         return FeedbackResponse(accepted=accepted, total_events=len(body.events))
+
+    def _check_feedback_limits(self, principal: Principal, source: str) -> None:
+        """Per-source bucket first, then the per-key bucket that actually bounds the client."""
+        for reason, limiter, key in (
+            ("rate_limited", self._feedback_limiter, f"{principal.key_id}:{source}"),
+            ("client_rate_limited", self._feedback_client_limiter, principal.key_id),
+        ):
+            decision = limiter.check(key)
+            if not decision.allowed:
+                self.metrics.feedback_rejected_total.labels(reason=reason).inc()
+                raise AppError(
+                    429,
+                    "feedback_rate_limited",
+                    "This client is sending feedback too quickly.",
+                    headers={"Retry-After": str(decision.retry_after_seconds)},
+                )
 
     # --- admin ---
 
@@ -414,21 +445,22 @@ class CascadeService:
         )
 
     def swap_bundle(self, principal: Principal, body: BundleSwapRequest) -> AdminResponse:
-        """Load a bundle from disk, hash-verified, and swap it in; a refusal is audited too."""
+        """Load a bundle from disk, hash-verified, and swap it in; a refusal is audited too.
+
+        The directory is checked for containment in ``bundle_root`` (default ``data_dir``) *before*
+        the loader is called, so a leaked admin key cannot use the loader as an existence oracle for
+        arbitrary paths on the host. The live ``bundle_dir`` is always allowed, so reloading the
+        bundle the process is already serving works wherever it lives.
+        """
         directory = Path(body.directory)
         with self._admin_lock:
+            outside = self._outside_bundle_root(directory)
+            if outside is not None:
+                self._audit_swap_refusal(principal, directory, outside)
             try:
                 bundle: Bundle = self._load_bundle(directory)
             except (BundleIntegrityError, OSError, ValueError) as exc:
-                self.audit.append(
-                    principal.key_id,
-                    "bundle_swap_rejected",
-                    {"directory": str(directory), "error": type(exc).__name__},
-                )
-                self.metrics.admin_actions_total.labels(action="bundle_swap_rejected").inc()
-                raise AppError(
-                    422, "bundle_rejected", "The bundle failed verification and was not loaded."
-                ) from None
+                self._audit_swap_refusal(principal, directory, type(exc).__name__)
             previous = self.cascade.bundle.bundle_id
             self.cascade.swap_bundle(bundle)
             self.monitor.rebind()
@@ -452,6 +484,33 @@ class CascadeService:
             audit_seq=entry.seq,
             audit_hash=entry.hash,
         )
+
+    def _outside_bundle_root(self, directory: Path) -> str | None:
+        """``None`` when the directory may be loaded, else the reason to audit and refuse with.
+
+        Resolution happens before the check, so ``..`` segments, a symlink or a short 8.3 path
+        cannot walk out of the root, and a path that cannot be resolved at all is refused rather
+        than passed on.
+        """
+        try:
+            target = directory.resolve()
+            allowed = (self.settings.resolved_bundle_root, self.settings.bundle_dir.resolve())
+        except OSError:
+            return "unresolvable_path"
+        if target in allowed or any(target.is_relative_to(root) for root in allowed):
+            return None
+        return "outside_root"
+
+    def _audit_swap_refusal(self, principal: Principal, directory: Path, reason: str) -> NoReturn:
+        self.audit.append(
+            principal.key_id,
+            "bundle_swap_rejected",
+            {"directory": str(directory), "error": reason},
+        )
+        self.metrics.admin_actions_total.labels(action="bundle_swap_rejected").inc()
+        raise AppError(
+            422, "bundle_rejected", "The bundle failed verification and was not loaded."
+        ) from None
 
     @staticmethod
     def _index_digest(index: Any) -> str:
@@ -559,6 +618,7 @@ def build_service(
     *,
     controller: BudgetController | None = None,
     audit: AuditLog | None = None,
+    bundle_loader: Any = load_bundle,
 ) -> CascadeService:
     """Wire a bundle into a cascade, a monitor and a service using ``settings``."""
     budget = controller or BudgetController(
@@ -586,7 +646,9 @@ def build_service(
         canary_threshold=settings.canary_threshold,
         seed=bundle.manifest.seed,
     )
-    return CascadeService(cascade, monitor, metrics, settings, audit=audit)
+    return CascadeService(
+        cascade, monitor, metrics, settings, audit=audit, bundle_loader=bundle_loader
+    )
 
 
 def _worker_pool_lifespan(threads: int) -> Any:
@@ -652,7 +714,7 @@ def create_cascade_app(
 
     @app.post("/v1/feedback", response_model=FeedbackResponse)
     def feedback(body: FeedbackRequest, principal: ServingPrincipal) -> FeedbackResponse:
-        response = service.ingest(body)
+        response = service.ingest(principal, body)
         _log.info(
             "feedback_accepted",
             key_id=principal.key_id,

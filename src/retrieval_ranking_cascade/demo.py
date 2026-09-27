@@ -14,6 +14,8 @@ this one also:
 * corrupts half the vectors inside the live index and shows the recall canary catching it in one
   cycle;
 * flips one byte in a bundle artifact and shows the swap being refused and audited;
+* points an admin bundle swap at a directory outside the configured bundle root and shows it
+  refused before the loader is reached;
 * verifies the admin audit chain, then tampers with it and shows the verification failing.
 """
 
@@ -57,6 +59,10 @@ def _settings(workdir: Path, **overrides: Any) -> Settings:
         "api_key_sha256": [hash_api_key(_SERVING_KEY), hash_api_key(_ADMIN_KEY)],
         "admin_api_key_sha256": [hash_api_key(_ADMIN_KEY)],
         "bundle_dir": workdir / "bundle",
+        # Admin bundle swaps are confined to this root, which is why the tampered copy below has to
+        # live inside the work directory to reach the integrity check at all.
+        "data_dir": workdir,
+        "bundle_root": workdir,
         "audit_log_path": workdir / "audit" / "admin.jsonl",
         "rate_limit_per_second": 10_000.0,
         "rate_limit_burst": 10_000,
@@ -233,6 +239,17 @@ def run_demo(  # noqa: PLR0915 - a linear script of scenarios; splitting it hide
         )
         summary["tampered_bundle_status"] = rejected.status_code
         summary["tampered_bundle_code"] = rejected.json()["error"]["code"]
+
+        # A path outside the configured bundle root never reaches the loader at all.
+        outside = client.post(
+            "/v1/admin/bundle",
+            json={"directory": str(workdir.parent)},
+            headers=_ADMIN_AUTH,
+        )
+        summary["outside_root_bundle_status"] = outside.status_code
+        summary["outside_root_audit_reason"] = (
+            AuditLog(settings.audit_log_path).read()[-1].details["error"]
+        )
 
         good_swap = client.post(
             "/v1/admin/bundle", json={"directory": str(settings.bundle_dir)}, headers=_ADMIN_AUTH
