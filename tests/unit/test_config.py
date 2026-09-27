@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from retrieval_ranking_cascade.core.config import Settings, get_settings
+from retrieval_ranking_cascade.serving.cascade import CascadeConfig
 
 pytestmark = pytest.mark.unit
 
@@ -20,6 +21,22 @@ def test_defaults_fail_closed() -> None:
     assert settings.host == "127.0.0.1"
     assert settings.admin_api_key_sha256 == []
     assert settings.faiss_threads == 1
+
+
+def test_serving_defaults_match_the_depth_the_ablation_picked() -> None:
+    """The served rerank depth is a measured choice, so a silent drift back should fail here.
+
+    ``bench/bench_quality.py --ablations`` measures depth 100 as both better (corpus NDCG 0.6100
+    against 0.6054) and cheaper (3.96 ms against 4.65 ms per request) than the 150 this repo first
+    shipped. ``bench/bench_quality.py`` and ``bench/bench_load.py`` read this field rather than
+    repeating the number, so the ablation's baseline row and the load run are always the served
+    configuration. Changing the default means re-running the quality and load benches and updating
+    the README, which is what this test is here to insist on.
+    """
+    settings = Settings(_env_file=None)
+    assert settings.rerank_depth == 100
+    assert CascadeConfig().rerank_depth == settings.rerank_depth
+    assert settings.rerank_depth <= settings.candidate_k
 
 
 def test_environment_variables_are_parsed(monkeypatch: pytest.MonkeyPatch) -> None:

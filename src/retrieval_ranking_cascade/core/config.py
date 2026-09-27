@@ -71,8 +71,10 @@ class Settings(BaseSettings):
     max_k: int = Field(default=100, ge=1)
     candidate_k: int = Field(default=500, ge=1)
     max_candidate_k: int = Field(default=2_000, ge=1)
-    # Candidates stage 2 scores, out of candidate_k retrieved (see serving.cascade).
-    rerank_depth: int = Field(default=150, ge=1)
+    # Candidates stage 2 scores, out of candidate_k retrieved (see serving.cascade). 100 rather
+    # than the 150 this repo started with: the depth ablation in bench/bench_quality.py measures 100
+    # as both better and cheaper at `small` scale, and cost is linear in depth.
+    rerank_depth: int = Field(default=100, ge=1)
     default_ef_search: int = Field(default=768, ge=1)
     max_ef_search: int = Field(default=2_048, ge=1)
     # Query cost cap: candidate_k * sqrt(ef_search) must stay below this (see serving.cost).

@@ -79,7 +79,8 @@ class CascadeConfig:
     """Serving-side knobs. Bounds are enforced by the API layer before they reach here."""
 
     candidate_k: int = 500
-    rerank_depth: int = 150
+    # See core.config.Settings.rerank_depth: 100 is the depth the ablation picked.
+    rerank_depth: int = 100
     default_k: int = 20
     ef_search: int = 768
     mmr_lambda: float = 0.7
