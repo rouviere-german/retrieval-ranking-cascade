@@ -38,6 +38,7 @@ from typing import Any
 
 import numpy as np
 
+from retrieval_ranking_cascade.core.config import Settings
 from retrieval_ranking_cascade.data.generator import PERIOD_LABEL, PERIOD_TEST
 from retrieval_ranking_cascade.evaluation.offline import (
     corpus_evaluation,
@@ -87,8 +88,17 @@ MMR_SWEEP = (1.0, 0.7, 0.4)
 # means the same thing in the main table and in the ablations.
 CORPUS_USERS = 150
 DEPTH_SWEEP = (50, 100, 150, 250, 500)
-# The ablation's baseline equals the served default, so its rows compare with the main tables.
-DEFAULT_RERANK_DEPTH = 150
+# The ablation's baseline is the served default, read from the settings field rather than repeated
+# here, so the depth row that justifies that default cannot drift away from it. Read from the field
+# default and not from Settings() so this shell's environment cannot change what is measured.
+DEFAULT_RERANK_DEPTH = int(Settings.model_fields["rerank_depth"].default)
+# Catalogue sizes for the scaling block. Past the trained catalogue the rows are resampled from the
+# real embeddings (see ``_catalogue_of_size``), which is what makes a 100k-item measurement possible
+# from a `small` training run.
+SCALING_SIZES = (2_500, 10_000, 50_000, 100_000)
+# Candidate counts swept at the largest catalogue, each with the efSearch a deployment would pair
+# with it. 500 at 768 is what this cascade actually asks for.
+CANDIDATE_SWEEP = ((10, 64), (50, 128), (100, 256), (500, 768))
 BLOCKS = ("retrieval", "ranking", "corpus", "robustness", "canary")
 
 
@@ -178,40 +188,93 @@ def bench_retrieval(result: TrainingResult, sample: int = 200) -> dict[str, Any]
     }
 
 
+def _catalogue_of_size(vectors: np.ndarray, size: int, *, seed: int = 0) -> np.ndarray:
+    """``size`` item embeddings: a prefix of the trained ones, extended by resampling if needed.
+
+    The specification's world holds 100k items and every measured number in this repo comes from the
+    ``small`` world's 10k, which is exactly the range where a dense matmul beats a graph walk - so
+    without a larger catalogue the index is never shown either paying for itself or failing to. Rows
+    beyond the trained catalogue are real embeddings drawn with replacement, perturbed by Gaussian
+    noise and rescaled to the norm of the row they came from, which keeps the cluster structure HNSW
+    walks over and the norm distribution inner product depends on.
+
+    What this measures is honest and what it does not is worth saying plainly: search *cost* and
+    *recall against exact search on the same catalogue* are real measurements of the index at that
+    size, and nothing about relevance is, because the extra items are not items. Nothing downstream
+    consumes this catalogue - it is built, measured and dropped.
+    """
+    if size <= vectors.shape[0]:
+        return np.ascontiguousarray(vectors[:size])
+    rng = np.random.default_rng(seed)
+    base = vectors[rng.integers(0, vectors.shape[0], size=size - vectors.shape[0])]
+    grown = base + rng.normal(scale=0.05, size=base.shape).astype(np.float32)
+    norms = np.linalg.norm(grown, axis=1, keepdims=True)
+    grown *= np.linalg.norm(base, axis=1, keepdims=True) / np.maximum(norms, 1e-12)
+    return np.ascontiguousarray(np.vstack([vectors, grown]), dtype=np.float32)
+
+
 def bench_index_scaling(
-    result: TrainingResult, queries: np.ndarray, sizes: tuple[int, ...] = (2_500, 10_000, 50_000)
-) -> dict[str, dict[str, float]]:
-    """ANN versus exact latency as the catalogue grows, over prefixes of the real item embeddings.
+    result: TrainingResult, queries: np.ndarray, sizes: tuple[int, ...] = SCALING_SIZES
+) -> dict[str, Any]:
+    """ANN versus exact latency as the catalogue grows, and as the candidate count changes.
 
     The crossover is a fact about sizes, not an article of faith. A brute-force inner product is one
     dense matrix multiply, which BLAS runs with near-perfect locality, so at a few thousand
     32-dimensional vectors it simply beats a graph walk; its cost then grows linearly with the
-    catalogue while HNSW's stays nearly flat. Fitting those two lines gives
-    ``crossover_items_estimate``: the catalogue size at which the graph starts to pay, on this
-    machine, at this dimension and this ``k``.
+    catalogue while HNSW's grows with the number of nodes its walk has to visit. Fitting those two
+    lines gives ``crossover_items_estimate``: the catalogue size at which the graph starts to pay,
+    on this machine, at this dimension and at ``candidate_k``.
+
+    Size is only half of it, so the largest catalogue is also swept over the candidate count, each
+    with the ``efSearch`` a deployment would pair with it (``efSearch`` below ``k`` cannot return
+    ``k`` neighbours). The cascade's own request - 500 candidates at ``efSearch`` 768 - is the most
+    expensive point on that sweep, and the sweep is what shows whether the index or the matmul is
+    the right tool for it.
     """
-    bundle = result.bundle
     rows: dict[str, dict[str, float]] = {}
+    largest: tuple[Any, np.ndarray] | None = None
     for size in sizes:
-        if size > bundle.n_items:
-            continue
-        vectors = np.ascontiguousarray(bundle.item_vectors[:size])
+        vectors = _catalogue_of_size(result.bundle.item_vectors, size, seed=result.config.seed)
         index = HnswIndex.build(vectors, result.config.hnsw, threads=result.config.threads)
         k = min(result.config.candidate_k, size)
-        started = time.perf_counter()
-        _, approx = index.search(queries, k, ef_search=result.config.hnsw.ef_search)
-        ann_seconds = (time.perf_counter() - started) / queries.shape[0]
-        started = time.perf_counter()
-        _, exact = exact_top_k(queries, vectors, k)
-        exact_seconds = (time.perf_counter() - started) / queries.shape[0]
-        rows[str(size)] = {
-            "ann_ms": round(1000.0 * ann_seconds, 4),
-            "exact_ms": round(1000.0 * exact_seconds, 4),
-            "speedup": round(exact_seconds / ann_seconds, 2) if ann_seconds > 0 else 0.0,
-            "recall": round(float(recall_at_k(approx, exact).mean()), 6),
+        rows[str(size)] = _ann_versus_exact(
+            index, vectors, queries, k=k, ef_search=result.config.hnsw.ef_search
+        )
+        rows[str(size)]["resampled_items"] = max(0, size - result.bundle.n_items)
+        largest = (index, vectors)
+    report: dict[str, Any] = {"sizes": rows, **_crossover_estimate(rows)}
+    if largest is not None:
+        index, vectors = largest
+        report["candidates"] = {
+            "items": int(vectors.shape[0]),
+            "rows": {
+                str(k): {
+                    **_ann_versus_exact(index, vectors, queries, k=k, ef_search=ef),
+                    "ef_search": float(ef),
+                }
+                for k, ef in CANDIDATE_SWEEP
+                if k <= vectors.shape[0]
+            },
         }
-    rows.update(_crossover_estimate(rows))
-    return rows
+    return report
+
+
+def _ann_versus_exact(
+    index: Any, vectors: np.ndarray, queries: np.ndarray, *, k: int, ef_search: int
+) -> dict[str, float]:
+    """One (catalogue, k, efSearch) point: what each search costs per query, and ANN's recall."""
+    started = time.perf_counter()
+    _, approx = index.search(queries, k, ef_search=ef_search)
+    ann_seconds = (time.perf_counter() - started) / queries.shape[0]
+    started = time.perf_counter()
+    _, exact = exact_top_k(queries, vectors, k)
+    exact_seconds = (time.perf_counter() - started) / queries.shape[0]
+    return {
+        "ann_ms": round(1000.0 * ann_seconds, 4),
+        "exact_ms": round(1000.0 * exact_seconds, 4),
+        "speedup": round(exact_seconds / ann_seconds, 2) if ann_seconds > 0 else 0.0,
+        "recall": round(float(recall_at_k(approx, exact).mean()), 6),
+    }
 
 
 def _crossover_estimate(rows: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -282,8 +345,16 @@ def bench_ranking_and_bias(result: TrainingResult) -> dict[str, Any]:
 
 
 def bench_corpus(
-    result: TrainingResult, users: int = CORPUS_USERS, upper_bound_users: int = 40
+    result: TrainingResult, users: int = CORPUS_USERS, upper_bound_users: int = CORPUS_USERS
 ) -> dict[str, Any]:
+    """The corpus protocol over ``users`` sampled users, bound included for all of them.
+
+    ``upper_bound_users`` used to be a fraction of the sample to save the per-user full-catalogue
+    scoring pass, which left the ``exact_rank`` row averaged over a different population from every
+    other row in the same table. The pass costs a few seconds at ``small`` scale, so the whole
+    sample gets it and the table is comparable row by row; the ablations still pass 0, because they
+    only need the cascade's own number.
+    """
     cascade = _cascade(result)
     sample = make_user_sample(
         result.interactions.periods(PERIOD_TEST),
@@ -748,17 +819,19 @@ def _print_retrieval(retrieval: dict[str, Any]) -> None:
         f"{retrieval['exact_search_ms']:.3f} ms/query (ANN at the default efSearch is "
         f"{retrieval['speedup_vs_exact']}x faster)"
     )
-    if retrieval["scaling"]:
-        print("\n| catalogue size | ANN ms/query | exact ms/query | ANN speedup | recall |")
-        print("|---:|---:|---:|---:|---:|")
-        for size, row in retrieval["scaling"].items():
-            if not size.isdigit():
-                continue
+    scaling = retrieval.get("scaling") or {}
+    if scaling.get("sizes"):
+        print(
+            f"\n| catalogue size | resampled | ANN ms/query | exact ms/query | ANN speedup | "
+            f"recall@{retrieval['k']} |"
+        )
+        print("|---:|---:|---:|---:|---:|---:|")
+        for size, row in scaling["sizes"].items():
             print(
-                f"| {size} | {row['ann_ms']:.3f} | {row['exact_ms']:.3f} | {row['speedup']}x | "
-                f"{row['recall']:.4f} |"
+                f"| {size} | {row['resampled_items']:.0f} | {row['ann_ms']:.3f} | "
+                f"{row['exact_ms']:.3f} | {row['speedup']}x | {row['recall']:.4f} |"
             )
-        fit = retrieval["scaling"].get("fit")
+        fit = scaling.get("fit")
         if fit:
             print(
                 f"\nfitted cost: exact {fit['exact_ms_per_1k_items']:.4f} ms per 1k items "
@@ -766,6 +839,18 @@ def _print_retrieval(retrieval: dict[str, Any]) -> None:
                 f"{fit['ann_ms_per_1k_items']:.4f} ms per 1k items; the two lines meet near "
                 f"{fit['crossover_items_estimate']:.0f} items"
             )
+        candidates = scaling.get("candidates")
+        if candidates:
+            print(
+                f"\n| candidates (k) | efSearch | ANN ms/query | exact ms/query | ANN speedup | "
+                f"recall | ({candidates['items']} items) |"
+            )
+            print("|---:|---:|---:|---:|---:|---:|---|")
+            for k, row in candidates["rows"].items():
+                print(
+                    f"| {k} | {row['ef_search']:.0f} | {row['ann_ms']:.3f} | "
+                    f"{row['exact_ms']:.3f} | {row['speedup']}x | {row['recall']:.4f} | |"
+                )
 
 
 def _print_ranking(report: dict[str, Any]) -> None:
@@ -804,23 +889,34 @@ def _print_ranking(report: dict[str, Any]) -> None:
 
 
 def _print_corpus(corpus: dict[str, Any]) -> None:
-    print(f"\n### Full corpus top-{corpus['k']} ({corpus['users']} users)\n")
-    print("| policy | NDCG@10 | intra-list sim | coverage | cold-item share | cold-user NDCG |")
-    print("|---|---:|---:|---:|---:|---:|")
+    print(f"\n### Full corpus top-{corpus['k']} ({corpus['users']} users sampled)\n")
+    # Per-policy user counts, because a policy is skipped for a user it returns nothing for and the
+    # exact-ranking bound may be asked for over a subset: one count in the header would mislead.
+    print(
+        "| policy | users | NDCG@10 | intra-list sim | coverage | cold-item share | "
+        "cold-user NDCG (users) |"
+    )
+    print("|---|---:|---:|---:|---:|---:|---:|")
     for policy in ("popularity", "tower", "cascade_relevance", "cascade", "exact_rank"):
         row = corpus.get(policy)
         if not isinstance(row, dict):
             continue
         cold = row["cold_user_ndcg_at_k"]
+        cold_text = "n/a" if cold is None else f"{cold:.4f} ({row['cold_users']})"
         print(
-            f"| {policy} | {row['ndcg_at_k']:.4f} | {row['intra_list_similarity']:.4f} | "
-            f"{row['catalog_coverage']:.4f} | {row['cold_item_share']:.4f} | "
-            f"{'n/a' if cold is None else f'{cold:.4f}'} |"
+            f"| {policy} | {row['users']} | {row['ndcg_at_k']:.4f} | "
+            f"{row['intra_list_similarity']:.4f} | {row['catalog_coverage']:.4f} | "
+            f"{row['cold_item_share']:.4f} | {cold_text} |"
         )
     print(
         f"\ncascade_relevance retains {corpus.get('upper_bound_retained')} of the exact-ranking "
-        f"upper bound (gap {corpus.get('upper_bound_gap')}); MMR then costs "
+        f"bound (gap {corpus.get('upper_bound_gap')}) over the "
+        f"{corpus.get('upper_bound_paired_users')} users both scored; MMR then costs "
         f"{corpus['diversity_cost']} NDCG; simulated CTR {corpus['simulated']['ctr']}"
+    )
+    print(
+        "exact_rank is a raw top-k by model score: no MMR and no category cap, so it bounds the "
+        "ranker's reach and not a rules-constrained page."
     )
 
 
